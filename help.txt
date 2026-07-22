@@ -1,0 +1,30 @@
+# DiffSynth-Studio 环境配置步骤
+
+source /home/jbx/.bashrc
+proxy
+cd /home/jbx/Codes/DiffSynth-Studio
+
+mkdir -p /data/jbx/conda-pkgs /data/jbx/pip-cache /data/jbx/modelscope-cache /data/jbx/hf-cache /data/jbx/diffsynth-models /data/jbx/tmp
+export CONDA_PKGS_DIRS=/data/jbx/conda-pkgs
+conda create -y --override-channels -c conda-forge -n diffsynth-studio-py311 python=3.11 pip
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate diffsynth-studio-py311
+
+export TMPDIR=/data/jbx/tmp
+export PIP_CACHE_DIR=/data/jbx/pip-cache
+export MODELSCOPE_CACHE=/data/jbx/modelscope-cache
+export HF_HOME=/data/jbx/hf-cache
+export DIFFSYNTH_MODEL_BASE_PATH=/data/jbx/diffsynth-models
+export DIFFSYNTH_DOWNLOAD_SOURCE=modelscope
+export DIFFSYNTH_ATTENTION_IMPLEMENTATION=flash_attention_2
+
+python -m pip install -U pip setuptools wheel packaging ninja
+python -m pip install --retries 10 --timeout 180 torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --retries 10 --timeout 180 -e .
+
+curl -L --retry 20 --retry-all-errors --connect-timeout 30 -C - -o /data/jbx/tmp/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1%2Bcu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+python -m pip install --no-deps /data/jbx/tmp/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+python -m pip install --retries 10 --timeout 180 "xfuser>=0.4.3,<0.5"
+
+python -m pip check

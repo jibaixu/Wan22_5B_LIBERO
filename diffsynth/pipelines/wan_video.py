@@ -1,4 +1,5 @@
 import torch, types
+from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 from einops import repeat
@@ -27,6 +28,59 @@ from ..models.wan_video_animate_adapter import WanAnimateAdapter
 from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
+
+
+@dataclass(frozen=True)
+class WanFeatureCaptureSpec:
+    block_index: int = 20
+    denoise_step: int = 19
+    branch: str = "positive"
+    to_cpu: bool = True
+    dtype: torch.dtype = torch.bfloat16
+
+
+@dataclass(frozen=True)
+class WanFeatureCaptureResult:
+    feature: torch.Tensor
+    temporal_tokens: int
+    token_h: int
+    token_w: int
+    hidden_dim: int
+    token_order: str = "temporal_height_width"
+
+
+class _WanFeatureCollector:
+    def __init__(self, spec: WanFeatureCaptureSpec):
+        self.spec = spec
+        self.result = None
+
+    def collect(self, block_index, hidden, grid_shape):
+        if block_index != self.spec.block_index:
+            return
+        if self.result is not None:
+            raise RuntimeError("The requested Wan feature was captured more than once")
+        temporal_tokens, token_h, token_w = (int(value) for value in grid_shape)
+        expected_shape = (1, 1125, 3072)
+        if tuple(hidden.shape) != expected_shape:
+            raise RuntimeError(
+                f"Expected captured hidden shape {expected_shape}, got {tuple(hidden.shape)}"
+            )
+        if (temporal_tokens, token_h, token_w) != (5, 15, 15):
+            raise RuntimeError(
+                "Expected Wan2.2-TI2V-5B token grid (5, 15, 15), got "
+                f"{(temporal_tokens, token_h, token_w)}"
+            )
+        feature = hidden.detach().to(dtype=self.spec.dtype)
+        if self.spec.to_cpu:
+            feature = feature.cpu()
+        feature = feature[0].contiguous()
+        self.result = WanFeatureCaptureResult(
+            feature=feature,
+            temporal_tokens=temporal_tokens,
+            token_h=token_h,
+            token_w=token_w,
+            hidden_dim=feature.shape[-1],
+        )
 
 
 class WanVideoPipeline(BasePipeline):
@@ -106,6 +160,89 @@ class WanVideoPipeline(BasePipeline):
             self.vace2.forward = types.MethodType(usp_vace_forward, self.vace2)
         self.sp_size = get_sequence_parallel_world_size()
         self.use_unified_sequence_parallel = True
+
+
+    def _validate_feature_capture(
+        self,
+        capture: WanFeatureCaptureSpec,
+        num_inference_steps: int,
+        cfg_scale: float,
+        cfg_merge: bool,
+        sliding_window_size,
+        sliding_window_stride,
+        tea_cache_l1_thresh,
+    ):
+        if self.dit is None:
+            raise RuntimeError("Wan feature capture requires a loaded DiT")
+        if capture.branch not in {"positive", "negative"}:
+            raise ValueError(f"Unsupported capture branch {capture.branch!r}")
+        if not 0 <= capture.denoise_step < num_inference_steps:
+            raise ValueError("capture.denoise_step is outside the denoise schedule")
+        if capture.branch == "negative" and cfg_scale == 1.0:
+            raise ValueError("Negative-branch capture requires cfg_scale != 1")
+        if cfg_merge:
+            raise ValueError("Feature capture does not support merged CFG batches")
+        if sliding_window_size is not None or sliding_window_stride is not None:
+            raise ValueError("Feature capture does not support temporal sliding windows")
+        if tea_cache_l1_thresh is not None:
+            raise ValueError("Feature capture does not support TeaCache")
+        if getattr(self, "use_unified_sequence_parallel", False):
+            raise ValueError("LIBERO feature extraction must disable sequence parallel")
+
+        blocks = self.dit.blocks
+        if len(blocks) != 30:
+            raise RuntimeError(f"Expected 30 DiT blocks, got {len(blocks)}")
+        if not 0 <= capture.block_index < len(blocks):
+            raise ValueError("capture.block_index is outside the DiT block list")
+        num_heads = int(blocks[0].num_heads)
+        if self.dit.dim != 3072 or num_heads != 24 or self.dit.dim // num_heads != 128:
+            raise RuntimeError(
+                "Loaded DiT does not match Wan2.2-TI2V-5B dimensions "
+                f"(dim={self.dit.dim}, heads={num_heads})"
+            )
+        if tuple(self.dit.patch_size) != (1, 2, 2):
+            raise RuntimeError(f"Unexpected DiT patch size {self.dit.patch_size}")
+
+
+    @torch.inference_mode()
+    def extract_dit_feature(
+        self,
+        prompt: str,
+        input_image: Image.Image,
+        height: int = 480,
+        width: int = 480,
+        num_frames: int = 17,
+        seed: int = 42,
+        num_inference_steps: int = 20,
+        sigma_shift: float = 5.0,
+        cfg_scale: float = 5.0,
+        negative_prompt: str = "",
+        rand_device: str = "cpu",
+        tiled: bool = False,
+        capture: WanFeatureCaptureSpec = WanFeatureCaptureSpec(),
+        decode_video: bool = False,
+        progress_bar_cmd=tqdm,
+    ):
+        if decode_video:
+            raise ValueError("extract_dit_feature only supports decode_video=False")
+        return self(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            input_image=input_image,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            seed=seed,
+            rand_device=rand_device,
+            cfg_scale=cfg_scale,
+            cfg_merge=False,
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            tiled=tiled,
+            progress_bar_cmd=progress_bar_cmd,
+            _feature_capture=capture,
+            _decode_video=False,
+        )
 
 
     @staticmethod
@@ -266,7 +403,22 @@ class WanVideoPipeline(BasePipeline):
         # progress_bar
         progress_bar_cmd=tqdm,
         output_type: Literal["quantized", "floatpoint"] = "quantized",
+        # Internal feature-extraction controls. Use extract_dit_feature() instead.
+        _feature_capture: WanFeatureCaptureSpec = None,
+        _decode_video: bool = True,
     ):
+        feature_collector = None
+        if _feature_capture is not None:
+            self._validate_feature_capture(
+                _feature_capture,
+                num_inference_steps,
+                cfg_scale,
+                cfg_merge,
+                sliding_window_size,
+                sliding_window_stride,
+                tea_cache_l1_thresh,
+            )
+            feature_collector = _WanFeatureCollector(_feature_capture)
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
         
@@ -320,12 +472,48 @@ class WanVideoPipeline(BasePipeline):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
             
             # Inference
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+            positive_collector = (
+                feature_collector
+                if feature_collector is not None
+                and progress_id == _feature_capture.denoise_step
+                and _feature_capture.branch == "positive"
+                else None
+            )
+            positive_capture_kwargs = (
+                {"feature_collector": positive_collector}
+                if positive_collector is not None
+                else {}
+            )
+            noise_pred_posi = self.model_fn(
+                **models,
+                **inputs_shared,
+                **inputs_posi,
+                timestep=timestep,
+                **positive_capture_kwargs,
+            )
             if cfg_scale != 1.0:
                 if cfg_merge:
                     noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
                 else:
-                    noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                    negative_collector = (
+                        feature_collector
+                        if feature_collector is not None
+                        and progress_id == _feature_capture.denoise_step
+                        and _feature_capture.branch == "negative"
+                        else None
+                    )
+                    negative_capture_kwargs = (
+                        {"feature_collector": negative_collector}
+                        if negative_collector is not None
+                        else {}
+                    )
+                    noise_pred_nega = self.model_fn(
+                        **models,
+                        **inputs_shared,
+                        **inputs_nega,
+                        timestep=timestep,
+                        **negative_capture_kwargs,
+                    )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
@@ -345,6 +533,11 @@ class WanVideoPipeline(BasePipeline):
         # post-denoising, pre-decoding processing logic
         for unit in self.post_units:
             inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+        if not _decode_video:
+            self.load_models_to_device([])
+            if feature_collector is None or feature_collector.result is None:
+                raise RuntimeError("The requested Wan feature was not captured")
+            return feature_collector.result
         # Decode
         self.load_models_to_device(['vae'])
         if framewise_decoding:
@@ -1311,6 +1504,7 @@ def model_fn_wan_video(
     wantodance_fps: float = 30.0,
     music_feature = None,
     skip_9th_layer: bool = False,
+    feature_collector = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1565,6 +1759,9 @@ def model_fn_wan_video(
                     use_gradient_checkpointing_offload,
                     x, context, t_mod, freqs
                 )
+
+            if feature_collector is not None:
+                feature_collector.collect(block_id, x, (f, h, w))
               
             
             # VACE

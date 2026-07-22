@@ -11,10 +11,26 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
 
-    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    timestep_id = inputs.get("validation_timestep_id")
+    if timestep_id is None:
+        timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    else:
+        timestep_id = torch.as_tensor(timestep_id, dtype=torch.long).reshape(1)
+        if not min_timestep_boundary <= int(timestep_id.item()) < max_timestep_boundary:
+            raise ValueError("validation_timestep_id is outside the configured boundary")
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
     
-    noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)
+    noise = inputs.get("validation_noise")
+    if noise is None:
+        noise = torch.randn_like(inputs["input_latents"])
+    else:
+        if tuple(noise.shape) != tuple(inputs["input_latents"].shape):
+            raise ValueError("validation_noise shape does not match input_latents")
+        noise = noise.to(
+            device=inputs["input_latents"].device,
+            dtype=inputs["input_latents"].dtype,
+        )
+    noise = noise * inputs.get("noise_scale", 1.0)
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
     training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
     
