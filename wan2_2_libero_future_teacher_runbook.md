@@ -12,7 +12,8 @@
 | `examples/wanvideo/model_training/train_libero_future.py` | LIBERO 专用 Python 训练入口；加载在线 17 帧窗口并复用现有 Wan SFT loss | 通常由 LoRA/full shell 脚本调用，不建议手写全部参数 |
 | `examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B-LIBERO.sh` | 以 8 GPU、micro-batch 1、gradient accumulation 4 训练默认 LoRA | 默认训练方案，优先使用 |
 | `examples/wanvideo/model_training/full/Wan2.2-TI2V-5B-LIBERO.sh` | 使用 DeepSpeed ZeRO-3 对 DiT 做 full fine-tuning | 容量对照实验；不阻塞 LoRA 主流程 |
-| `examples/wanvideo/model_training/validate_libero_future.py` | 计算确定性 held-out flow loss、选择 checkpoint，并生成 base/tuned/GT 对照视频 | 正式抽取前建立 loss 和视频双重门禁 |
+| `examples/wanvideo/model_training/validate_libero_future_parallel.py` | 多 GPU 按 checkpoint 分片计算确定性 held-out flow loss，并选择 mean loss 最低 checkpoint | 多个 `step-*.safetensors` / `epoch-*.safetensors` 候选筛选时优先使用 |
+| `examples/wanvideo/model_training/validate_libero_future.py` | 单进程 loss validation，并生成 base/tuned/GT 对照视频 | 调试小规模 loss，或对选中 checkpoint 执行视频门禁 |
 | `examples/wanvideo/model_inference/extract_libero_future_features.py` | 单进程或 `torchrun` 下执行 feature 抽取、原子写入、resume 和 audit | 单卡 smoke、定向重算、调试或完整性审计 |
 | `examples/wanvideo/model_inference/run_extract_libero_future_features.sh` | 封装 8 GPU 正式独立 episode 分片抽取 | validation 通过后的正式全量抽取 |
 | `tests/test_libero_future_teacher.py` | 检查数据统计、窗口尾部 padding、capture branch/step/block 和缓存契约 | 迁移服务器后先执行的 CPU 回归测试 |
@@ -202,7 +203,21 @@ LoRA 与 full checkpoint 不能在同一次 validation 调用中混合。分别�
 
 ### 7.1 确定性 validation loss
 
-目的：在完全相同的 256 个 val windows、timesteps 和 noise 上比较 base 与所有候选 checkpoint，并自动选择 mean loss 最低者。
+目的：在完全相同的 256 个 val windows、timesteps 和 noise 上比较 base 与所有候选 checkpoint，并自动选择 mean loss 最低者。默认使用 8 GPU checkpoint-parallel validation：rank 0 评估 base model，每个 rank 评估一部分 LoRA checkpoint，最后合并为与原流程兼容的 `validation_report.json` 和 `validation_summary.csv`。
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  examples/wanvideo/model_training/validate_libero_future_parallel.py \
+  --val-manifest "${RUN_ROOT}/manifests/val.jsonl" \
+  --output-dir "${RUN_ROOT}/validation/lora" \
+  --checkpoint-type lora \
+  --checkpoints "${RUN_ROOT}"/lora_sft/step-*.safetensors \
+  --mode loss \
+  --loss-samples 256 \
+  --seed 42
+```
+
+若只调试少量 checkpoint 或只申请到单 GPU，可退化为原单进程入口：
 
 ```bash
 python examples/wanvideo/model_training/validate_libero_future.py \
@@ -211,7 +226,7 @@ python examples/wanvideo/model_training/validate_libero_future.py \
   --checkpoint-type lora \
   --checkpoints "${RUN_ROOT}"/lora_sft/step-*.safetensors \
   --mode loss \
-  --loss-samples 256 \
+  --loss-samples 32 \
   --seed 42
 ```
 
@@ -264,10 +279,11 @@ python -c 'import json,sys; x=json.load(open(sys.argv[1])); print({k:x[k] for k 
 
 目的：对 full fine-tuning 产生的 `epoch-*.safetensors` 使用独立报告完成相同的 loss/video 门禁，避免和 LoRA checkpoint 混合比较。
 
-先执行 loss validation：
+先执行 loss validation。默认使用 8 GPU checkpoint-parallel validation：
 
 ```bash
-python examples/wanvideo/model_training/validate_libero_future.py \
+torchrun --standalone --nproc_per_node=8 \
+  examples/wanvideo/model_training/validate_libero_future_parallel.py \
   --val-manifest "${RUN_ROOT}/manifests/val.jsonl" \
   --output-dir "${RUN_ROOT}/validation/full" \
   --checkpoint-type full \
