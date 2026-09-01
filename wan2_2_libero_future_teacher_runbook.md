@@ -2,6 +2,12 @@
 
 本文档说明如何从 LIBERO manifest 构建开始，完成 Wan2.2-TI2V-5B 的 LoRA 或 full fine-tuning、checkpoint 验证、teacher feature 抽取、断点续跑和完整性审计。
 
+### Confidence-aware future teacher
+
+正式 future teacher 抽取使用 `--confidence-aware --num-teacher-samples 4`。每个 anchor 的四次推理只改变显式 diffusion seed，抽取器以 float32 流式累加器保存均值 feature 和 token-level pairwise cosine disagreement，不写入四份中间 feature。分片运行会先写 `complete=false, calibration=pending` 的缓存；无 episode 过滤的全量重跑会从全量训练 episode 的 disagreement 计算 q05/q95，并原子重写 `confidence`、`complete=true` 及 `confidence_manifest.json`。
+
+confidence-aware 缓存目录为 `wan2_2_future_latent_h16_step20_block20z_stride8_480x480_samples4_confv1`，新增 tensor 为 `confidence [A] float32` 和 `disagreement [A] float32`。旧目录仍保留为 legacy 单次 target，不能与 confidence-aware 缓存混用。
+
 正式长训练和全量特征抽取建议在目标服务器执行。所有 checkpoint、日志和验证视频写入 `/data/jibaixu/Ckpts`，预训练模型写入 `/data/jibaixu/Models`，不要写入系统盘或仓库目录。
 
 ## 1. 启动入口总览

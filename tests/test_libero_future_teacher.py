@@ -30,7 +30,9 @@ from tools.build_libero_future_manifest import (  # noqa: E402
 )
 from extract_libero_future_features import (  # noqa: E402
     REQUIRED_METADATA,
+    _FeatureSampleAccumulator,
     cache_metadata,
+    confidence_cache_metadata,
     expected_anchor_frames,
     expected_valid_future_frames,
     validate_episode_cache,
@@ -176,6 +178,51 @@ class TestCacheValidation(unittest.TestCase):
                 self.write(tensors, metadata)
                 valid, _ = validate_episode_cache(self.path, self.episode, self.metadata)
                 self.assertFalse(valid)
+
+    def test_confidence_cache_accepts_pending_and_finalized_metadata(self):
+        metadata = confidence_cache_metadata(
+            self.episode, "/tmp/checkpoint.safetensors", "abc", 42, 4
+        )
+        tensors = {
+            "features": self.features,
+            "anchor_frames": self.anchors,
+            "valid_future_frames": self.valid,
+            "confidence": torch.ones(1, dtype=torch.float32),
+            "disagreement": torch.zeros(1, dtype=torch.float32),
+        }
+        self.write(tensors, metadata)
+        self.assertTrue(
+            validate_episode_cache(self.path, self.episode, metadata, allow_pending=True)[0]
+        )
+        self.assertFalse(validate_episode_cache(self.path, self.episode, metadata)[0])
+        finalized = confidence_cache_metadata(
+            self.episode, "/tmp/checkpoint.safetensors", "abc", 42, 4,
+            complete=True, calibration={"q_low": 0.0, "q_high": 1.0, "eps": 1e-8},
+        )
+        self.write(tensors, finalized)
+        self.assertTrue(validate_episode_cache(self.path, self.episode, finalized)[0])
+
+    def test_streaming_disagreement_matches_explicit_pairs(self):
+        samples = [torch.randn(5, 7) for _ in range(4)]
+        accumulator = _FeatureSampleAccumulator()
+        for sample in samples:
+            accumulator.add(sample)
+        mean_feature, disagreement = accumulator.finalize()
+        self.assertTrue(torch.allclose(mean_feature, torch.stack(samples).mean(dim=0)))
+        normalized = [
+            torch.nn.functional.normalize(
+                torch.nn.functional.layer_norm(sample, (sample.shape[-1],)), dim=-1
+            )
+            for sample in samples
+        ]
+        pairwise = torch.stack(
+            [
+                (normalized[i] * normalized[j]).sum(dim=-1)
+                for i in range(4) for j in range(i + 1, 4)
+            ]
+        )
+        expected = (1.0 - pairwise.mean(dim=0)).median()
+        self.assertTrue(torch.allclose(disagreement, expected, atol=1e-6))
 
 
 class _LatentUnit(PipelineUnit):

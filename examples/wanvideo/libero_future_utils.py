@@ -11,6 +11,11 @@ BASE_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B"
 FEATURE_DIRECTORY = "wan2_2_future_latent_h16_step20_block20z_stride8_480x480"
 
 
+def confidence_feature_directory(num_teacher_samples=4):
+    """Directory name for mean-target, confidence-aware future features."""
+    return f"{FEATURE_DIRECTORY}_samples{int(num_teacher_samples)}_confv1"
+
+
 def wan_model_configs():
     return [
         ModelConfig(
@@ -65,12 +70,13 @@ def checkpoint_sha256(path, chunk_size=8 * 1024 * 1024):
     return digest.hexdigest()
 
 
-def teacher_seed(base_seed, suite_id, episode_index, anchor_frame):
+def teacher_seed(base_seed, suite_id, episode_index, anchor_frame, sample_index=0):
     return (
         base_seed
         + suite_id * 100_000_000
         + episode_index * 1_000_003
         + anchor_frame * 9_176
+        + sample_index * 97_531
     ) % (2**31)
 
 

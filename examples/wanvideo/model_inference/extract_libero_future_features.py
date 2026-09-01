@@ -30,6 +30,7 @@ from libero_future_utils import (  # noqa: E402
     FEATURE_DIRECTORY,
     absolute_checkpoint_path,
     checkpoint_sha256,
+    confidence_feature_directory,
     load_wan_pipe,
     teacher_seed,
 )
@@ -37,6 +38,7 @@ from diffsynth.pipelines.wan_video import WanFeatureCaptureSpec  # noqa: E402
 
 
 REQUIRED_TENSOR_KEYS = {"features", "anchor_frames", "valid_future_frames"}
+CONFIDENCE_TENSOR_KEYS = {"confidence", "disagreement"}
 REQUIRED_METADATA = {
     "complete": "true",
     "teacher": BASE_MODEL_ID,
@@ -87,7 +89,9 @@ def expected_valid_future_frames(episode_length, anchors):
     return torch.clamp(episode_length - 1 - anchors, min=0, max=16).to(torch.int16)
 
 
-def validate_episode_cache(path, episode, expected_metadata):
+def validate_episode_cache(
+    path, episode, expected_metadata, allow_pending=False, check_finite=False
+):
     path = Path(path)
     if not path.is_file() or path.stat().st_size == 0:
         return False, "missing or empty file"
@@ -97,9 +101,24 @@ def validate_episode_cache(path, episode, expected_metadata):
             if not REQUIRED_TENSOR_KEYS.issubset(keys):
                 return False, f"missing tensor keys: {sorted(REQUIRED_TENSOR_KEYS - keys)}"
             metadata = file.metadata() or {}
+            confidence_aware = metadata.get("confidence_aware") == "true"
             for key, value in expected_metadata.items():
+                if confidence_aware and key == "complete":
+                    continue
                 if metadata.get(key) != str(value):
                     return False, f"metadata mismatch for {key}"
+            if confidence_aware:
+                if not CONFIDENCE_TENSOR_KEYS.issubset(keys):
+                    return False, "missing confidence-aware tensor keys"
+                complete = metadata.get("complete", "false") == "true"
+                if not complete and not allow_pending:
+                    return False, "cache is pending confidence calibration"
+                if metadata.get("extraction_complete") != "true":
+                    return False, "confidence extraction is incomplete"
+                if complete and metadata.get("calibration") != "train_quantile_05_95":
+                    return False, "cache has no finalized confidence calibration"
+            elif metadata.get("complete") != "true":
+                return False, "cache is incomplete"
 
             expected_anchors = expected_anchor_frames(int(episode["episode_length"]))
             expected_valid = expected_valid_future_frames(
@@ -122,6 +141,27 @@ def validate_episode_cache(path, episode, expected_metadata):
             if valid_slice.get_dtype() != "I16":
                 return False, "valid-future dtype mismatch"
 
+            if confidence_aware:
+                if check_finite:
+                    features = file.get_tensor("features")
+                    if not torch.isfinite(features.float()).all():
+                        return False, "non-finite teacher features"
+                confidence_slice = file.get_slice("confidence")
+                disagreement_slice = file.get_slice("disagreement")
+                expected_scalar_shape = [len(expected_anchors)]
+                if confidence_slice.get_shape() != expected_scalar_shape:
+                    return False, "confidence shape mismatch"
+                if disagreement_slice.get_shape() != expected_scalar_shape:
+                    return False, "disagreement shape mismatch"
+                if confidence_slice.get_dtype() != "F32" or disagreement_slice.get_dtype() != "F32":
+                    return False, "confidence/disagreement dtype mismatch"
+                confidence = file.get_tensor("confidence")
+                disagreement = file.get_tensor("disagreement")
+                if not torch.isfinite(confidence).all() or not torch.isfinite(disagreement).all():
+                    return False, "non-finite confidence statistics"
+                if torch.any(confidence < 0) or torch.any(confidence > 1):
+                    return False, "confidence outside [0, 1]"
+
             anchors = file.get_tensor("anchor_frames")
             valid = file.get_tensor("valid_future_frames")
             if not torch.equal(anchors, expected_anchors):
@@ -135,7 +175,10 @@ def validate_episode_cache(path, episode, expected_metadata):
     return True, "ok"
 
 
-def cache_compatibility_metadata(episode, checkpoint_path, checkpoint_hash, base_seed):
+def cache_compatibility_metadata(
+    episode, checkpoint_path, checkpoint_hash, base_seed,
+    confidence_aware=False, num_teacher_samples=4,
+):
     anchors = expected_anchor_frames(episode["episode_length"])
     seeds = [
         teacher_seed(
@@ -160,7 +203,69 @@ def cache_compatibility_metadata(episode, checkpoint_path, checkpoint_hash, base
             "anchor_seeds": ",".join(str(seed) for seed in seeds),
         }
     )
+    if confidence_aware:
+        metadata.update(
+            {
+                "confidence_aware": "true",
+                "confidence_version": "v1",
+                "num_teacher_samples": str(int(num_teacher_samples)),
+                "target_aggregation": "mean",
+            }
+        )
     return {key: str(value) for key, value in metadata.items()}
+
+
+def confidence_cache_metadata(
+    episode, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples,
+    complete=False, calibration=None,
+):
+    metadata = cache_compatibility_metadata(
+        episode, checkpoint_path, checkpoint_hash, base_seed,
+        confidence_aware=True, num_teacher_samples=num_teacher_samples,
+    )
+    metadata.update(
+        {
+            "complete": str(bool(complete)).lower(),
+            "extraction_complete": "true",
+            "confidence_aware": "true",
+            "confidence_version": "v1",
+            "num_teacher_samples": str(int(num_teacher_samples)),
+            "target_aggregation": "mean",
+            "uncertainty_metric": "pairwise_cosine_disagreement",
+            "feature_normalization": "layernorm_last_dim",
+            "uncertainty_normalization": "l2_last_dim",
+            "uncertainty_aggregation": "median_token",
+            "calibration": "train_quantile_05_95" if calibration else "pending",
+            "seed_policy": "explicit_per_anchor",
+            "sample_seed_formula": "(base_seed + suite_id*100000000 + episode_index*1000003 + anchor_frame*9176 + sample_index*97531) % 2**31",
+            "sample_seeds": json.dumps(
+                [
+                    [
+                        teacher_seed(
+                            base_seed,
+                            episode["suite_id"],
+                            episode["episode_index"],
+                            int(anchor),
+                            sample_index,
+                        )
+                        for sample_index in range(int(num_teacher_samples))
+                    ]
+                    for anchor in expected_anchor_frames(episode["episode_length"]).tolist()
+                ],
+                separators=(",", ":"),
+            ),
+        }
+    )
+    if calibration:
+        metadata.update(
+            {
+                "calibration_q_low": f"{calibration['q_low']:.9g}",
+                "calibration_q_high": f"{calibration['q_high']:.9g}",
+                "calibration_eps": f"{calibration['eps']:.9g}",
+                "calibration_scope": "all_training_episodes",
+            }
+        )
+    return metadata
 
 
 def cache_metadata(episode, checkpoint_path, checkpoint_hash, base_seed):
@@ -177,11 +282,12 @@ def cache_metadata(episode, checkpoint_path, checkpoint_hash, base_seed):
     return metadata
 
 
-def episode_output_path(episode, output_root=None):
+def episode_output_path(episode, output_root=None, confidence_aware=False, num_teacher_samples=4):
+    directory = confidence_feature_directory(num_teacher_samples) if confidence_aware else FEATURE_DIRECTORY
     if output_root is None:
-        feature_root = Path(episode["dataset_root"]) / FEATURE_DIRECTORY
+        feature_root = Path(episode["dataset_root"]) / directory
     else:
-        feature_root = Path(output_root).expanduser().resolve() / episode["suite"] / FEATURE_DIRECTORY
+        feature_root = Path(output_root).expanduser().resolve() / episode["suite"] / directory
     chunk_id = episode["episode_index"] // episode["chunks_size"]
     return feature_root / f"chunk-{chunk_id:03d}" / f"episode_{episode['episode_index']:06d}.safetensors"
 
@@ -191,36 +297,79 @@ def read_anchor_image(reader, anchor_frame):
     return image.resize((480, 480), resample=Image.Resampling.BILINEAR)
 
 
-def extract_episode(pipe, episode, checkpoint_path, checkpoint_hash, base_seed, output_path):
+class _FeatureSampleAccumulator:
+    """Streaming mean and disagreement statistics for one anchor."""
+
+    def __init__(self):
+        self.feature_sum = None
+        self.normalized_sum = None
+        self.normalized_sqnorm_sum = None
+        self.sample_count = 0
+        self.expected_shape = None
+
+    def add(self, feature):
+        feature = feature.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if not torch.isfinite(feature).all():
+            raise RuntimeError("Teacher feature contains non-finite values")
+        if self.expected_shape is None:
+            self.expected_shape = tuple(feature.shape)
+            self.feature_sum = torch.zeros_like(feature)
+            self.normalized_sum = torch.zeros_like(feature)
+            self.normalized_sqnorm_sum = torch.zeros(feature.shape[0], dtype=torch.float32)
+        elif tuple(feature.shape) != self.expected_shape:
+            raise RuntimeError("Teacher sample shapes are inconsistent")
+        normalized = torch.nn.functional.layer_norm(feature, (feature.shape[-1],))
+        normalized = torch.nn.functional.normalize(normalized, dim=-1)
+        self.feature_sum.add_(feature)
+        self.normalized_sum.add_(normalized)
+        self.normalized_sqnorm_sum.add_((normalized * normalized).sum(dim=-1))
+        self.sample_count += 1
+
+    def finalize(self):
+        if self.sample_count == 0:
+            raise RuntimeError("No teacher samples were produced")
+        mean_feature = self.feature_sum / float(self.sample_count)
+        if self.sample_count < 2:
+            disagreement = torch.zeros((), dtype=torch.float32)
+        else:
+            pairwise_cosine = (
+                self.normalized_sum.square().sum(dim=-1) - self.normalized_sqnorm_sum
+            ) / float(self.sample_count * (self.sample_count - 1))
+            disagreement = (1.0 - pairwise_cosine).clamp_(0.0, 2.0).median()
+        return mean_feature, disagreement
+
+
+def extract_episode(
+    pipe, episode, checkpoint_path, checkpoint_hash, base_seed, output_path,
+    confidence_aware=False, num_teacher_samples=4,
+):
     anchors = expected_anchor_frames(episode["episode_length"])
     valid = expected_valid_future_frames(episode["episode_length"], anchors)
     features = []
+    disagreements = []
     reader = imageio.get_reader(episode["video_path"])
     try:
         for anchor in anchors.tolist():
             image = read_anchor_image(reader, anchor)
-            seed = teacher_seed(
-                base_seed,
-                episode["suite_id"],
-                episode["episode_index"],
-                anchor,
-            )
-            result = pipe.extract_dit_feature(
-                prompt=episode["prompt"],
-                input_image=image,
-                height=480,
-                width=480,
-                num_frames=17,
-                seed=seed,
-                num_inference_steps=20,
-                sigma_shift=5.0,
-                cfg_scale=5.0,
-                negative_prompt="",
-                rand_device="cpu",
-                tiled=False,
-                capture=WanFeatureCaptureSpec(),
-            )
-            features.append(result.feature)
+            accumulator = _FeatureSampleAccumulator()
+            sample_count = num_teacher_samples if confidence_aware else 1
+            for sample_index in range(sample_count):
+                seed = teacher_seed(
+                    base_seed, episode["suite_id"], episode["episode_index"],
+                    anchor, sample_index,
+                )
+                result = pipe.extract_dit_feature(
+                    prompt=episode["prompt"], input_image=image, height=480,
+                    width=480, num_frames=17, seed=seed, num_inference_steps=20,
+                    sigma_shift=5.0, cfg_scale=5.0, negative_prompt="",
+                    rand_device="cpu", tiled=False, capture=WanFeatureCaptureSpec(),
+                )
+                accumulator.add(result.feature)
+                del result
+            mean_feature, disagreement = accumulator.finalize()
+            features.append(mean_feature.to(dtype=torch.bfloat16))
+            disagreements.append(disagreement)
+            del accumulator, mean_feature, disagreement
     finally:
         reader.close()
 
@@ -229,17 +378,78 @@ def extract_episode(pipe, episode, checkpoint_path, checkpoint_hash, base_seed, 
         "anchor_frames": anchors,
         "valid_future_frames": valid,
     }
-    metadata = cache_metadata(episode, checkpoint_path, checkpoint_hash, base_seed)
+    if confidence_aware:
+        tensors["disagreement"] = torch.stack(disagreements).to(dtype=torch.float32)
+        tensors["confidence"] = torch.ones(len(disagreements), dtype=torch.float32)
+        metadata = confidence_cache_metadata(
+            episode, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples,
+        )
+    else:
+        metadata = cache_metadata(episode, checkpoint_path, checkpoint_hash, base_seed)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
     temporary.unlink(missing_ok=True)
     save_file(tensors, temporary, metadata=metadata)
-    valid_file, reason = validate_episode_cache(temporary, episode, metadata)
+    valid_file, reason = validate_episode_cache(
+        temporary, episode, metadata, allow_pending=confidence_aware
+    )
     if not valid_file:
         temporary.unlink(missing_ok=True)
         raise RuntimeError(f"Temporary cache validation failed: {reason}")
     os.replace(temporary, output_path)
     return len(anchors), output_path.stat().st_size
+
+
+def finalize_confidence_cache(episodes, output_root, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples, manifest_path):
+    paths = [episode_output_path(e, output_root, True, num_teacher_samples) for e in episodes]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Cannot finalize confidence cache; missing files: {missing[:3]}")
+    raw_values = []
+    for path in paths:
+        with safe_open(path, framework="pt", device="cpu") as file:
+            raw_values.append(file.get_tensor("disagreement").float())
+    raw = torch.cat(raw_values)
+    if raw.numel() == 0 or not torch.isfinite(raw).all():
+        raise RuntimeError("Cannot calibrate empty or non-finite disagreement statistics")
+    q_low = float(torch.quantile(raw, 0.05).item())
+    q_high = float(torch.quantile(raw, 0.95).item())
+    calibration = {"q_low": q_low, "q_high": q_high, "eps": 1e-8}
+    for episode, path in zip(episodes, paths):
+        with safe_open(path, framework="pt", device="cpu") as file:
+            tensors = {
+                "features": file.get_tensor("features").contiguous(),
+                "anchor_frames": file.get_tensor("anchor_frames").contiguous(),
+                "valid_future_frames": file.get_tensor("valid_future_frames").contiguous(),
+                "disagreement": file.get_tensor("disagreement").float().contiguous(),
+            }
+            metadata = dict(file.metadata() or {})
+        confidence = 1.0 - (tensors["disagreement"] - q_low) / (q_high - q_low + calibration["eps"])
+        tensors["confidence"] = confidence.clamp_(0.0, 1.0).float().contiguous()
+        metadata.update(confidence_cache_metadata(
+            episode, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples,
+            complete=True, calibration=calibration,
+        ))
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        save_file(tensors, temporary, metadata=metadata)
+        valid_file, reason = validate_episode_cache(
+            temporary, episode, metadata, check_finite=True
+        )
+        if not valid_file:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError(f"Finalized cache validation failed: {reason}")
+        os.replace(temporary, path)
+    atomic_json(manifest_path, {
+        "confidence_aware": True, "confidence_version": "v1",
+        "num_teacher_samples": int(num_teacher_samples),
+        "calibration": "train_quantile_05_95",
+        "calibration_scope": "all_training_episodes", "q_low": q_low,
+        "q_high": q_high, "eps": calibration["eps"],
+        "episode_count": len(paths), "anchor_count": int(raw.numel()),
+        "checkpoint_path": checkpoint_path, "checkpoint_sha256": checkpoint_hash,
+    })
+    return calibration
 
 
 def atomic_json(path, data):
@@ -309,6 +519,17 @@ def parse_args():
     parser.add_argument("--episode-end", type=int, default=None)
     parser.add_argument("--episode-indices", type=int, nargs="*", default=None)
     parser.add_argument("--base-seed", type=int, default=42)
+    parser.add_argument(
+        "--confidence-aware",
+        action="store_true",
+        help="Run multiple teacher samples and write mean target/confidence tensors.",
+    )
+    parser.add_argument(
+        "--num-teacher-samples",
+        type=int,
+        default=4,
+        help="Number of teacher realizations per anchor in confidence-aware mode.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--audit-only", action="store_true")
@@ -337,6 +558,10 @@ def main():
     args = parse_args()
     if args.audit_only and args.overwrite:
         raise ValueError("--audit-only and --overwrite cannot be used together")
+    if args.num_teacher_samples < 1:
+        raise ValueError("--num-teacher-samples must be positive")
+    if args.confidence_aware and args.num_teacher_samples < 2:
+        raise ValueError("--confidence-aware requires --num-teacher-samples >= 2")
     rank, local_rank, world_size = init_distributed()
     checkpoint_path = absolute_checkpoint_path(args.checkpoint_path)
     if not Path(checkpoint_path).is_file():
@@ -398,12 +623,20 @@ def main():
 
     pending = []
     for _, episode in assignments:
-        output_path = episode_output_path(episode, args.output_root)
+        output_path = episode_output_path(
+            episode, args.output_root, args.confidence_aware, args.num_teacher_samples
+        )
         compatibility = cache_compatibility_metadata(
-            episode, checkpoint_path, checkpoint_hash, args.base_seed
+            episode, checkpoint_path, checkpoint_hash, args.base_seed,
+            confidence_aware=args.confidence_aware,
+            num_teacher_samples=args.num_teacher_samples,
         )
         if output_path.is_file() and not args.overwrite:
-            is_valid, reason = validate_episode_cache(output_path, episode, compatibility)
+            is_valid, reason = validate_episode_cache(
+                output_path, episode, compatibility,
+                allow_pending=args.confidence_aware and not args.audit_only,
+                check_finite=args.audit_only,
+            )
             if is_valid:
                 progress["skipped_episodes"] += 1
                 progress["completed_episodes"] += 1
@@ -432,6 +665,8 @@ def main():
             checkpoint_hash,
             args.base_seed,
             output_path,
+            confidence_aware=args.confidence_aware,
+            num_teacher_samples=args.num_teacher_samples,
         )
         progress["completed_episodes"] += 1
         progress["anchors"] += anchors
@@ -447,7 +682,59 @@ def main():
     if world_size > 1:
         dist.barrier()
 
+    global_confidence_run = (
+        args.confidence_aware
+        and args.suites is None
+        and args.episode_start is None
+        and args.episode_end is None
+        and args.episode_indices is None
+        and not args.dry_run
+        and not args.audit_only
+    )
+    calibration = None
+    if rank == 0 and global_confidence_run:
+        manifest_path = (
+            Path(args.output_root).expanduser().resolve() / "confidence_manifest.json"
+            if args.output_root
+            else progress_dir / "confidence_manifest.json"
+        )
+        finalized = manifest_path.is_file()
+        if finalized:
+            for episode in episodes:
+                path = episode_output_path(
+                    episode, args.output_root, True, args.num_teacher_samples
+                )
+                compatibility = cache_compatibility_metadata(
+                    episode, checkpoint_path, checkpoint_hash, args.base_seed,
+                    confidence_aware=True,
+                    num_teacher_samples=args.num_teacher_samples,
+                )
+                valid_cache, _ = validate_episode_cache(path, episode, compatibility)
+                if not valid_cache:
+                    finalized = False
+                    break
+        if finalized:
+            with open(manifest_path, "r", encoding="utf-8") as file:
+                calibration = json.load(file)
+        else:
+            calibration = finalize_confidence_cache(
+                episodes,
+                args.output_root,
+                checkpoint_path,
+                checkpoint_hash,
+                args.base_seed,
+                args.num_teacher_samples,
+                manifest_path,
+            )
+    if world_size > 1:
+        dist.barrier()
+
     if rank == 0:
+        summary_allows_pending = (
+            args.confidence_aware
+            and not args.audit_only
+            and not global_confidence_run
+        )
         rank_progress = []
         for rank_id in range(world_size):
             path = progress_dir / f"rank-{rank_id:03d}.json"
@@ -463,7 +750,10 @@ def main():
             "completed_episodes": sum(item["completed_episodes"] for item in rank_progress),
             "anchors": sum(item["anchors"] for item in rank_progress),
             "bytes": sum(item["bytes"] for item in rank_progress),
-            "feature_directory": FEATURE_DIRECTORY,
+            "feature_directory": confidence_feature_directory(args.num_teacher_samples) if args.confidence_aware else FEATURE_DIRECTORY,
+            "confidence_aware": args.confidence_aware,
+            "num_teacher_samples": args.num_teacher_samples if args.confidence_aware else 1,
+            "calibration": calibration,
             "world_size": world_size,
             "smoke_test": args.smoke_test,
             "audit_only": args.audit_only,
@@ -475,18 +765,26 @@ def main():
         atomic_json(progress_dir / "extraction_summary.json", summary)
         for suite in sorted({episode["suite"] for _, episode in selected}):
             suite_episodes = [episode for _, episode in selected if episode["suite"] == suite]
-            feature_root = episode_output_path(suite_episodes[0], args.output_root).parents[1]
+            feature_root = episode_output_path(
+                suite_episodes[0], args.output_root, args.confidence_aware, args.num_teacher_samples
+            ).parents[1]
             suite_completed = 0
             suite_anchors = 0
             suite_bytes = 0
             suite_invalid = []
             for episode in suite_episodes:
-                output_path = episode_output_path(episode, args.output_root)
+                output_path = episode_output_path(
+                    episode, args.output_root, args.confidence_aware, args.num_teacher_samples
+                )
                 compatibility = cache_compatibility_metadata(
-                    episode, checkpoint_path, checkpoint_hash, args.base_seed
+                    episode, checkpoint_path, checkpoint_hash, args.base_seed,
+                    confidence_aware=args.confidence_aware,
+                    num_teacher_samples=args.num_teacher_samples,
                 )
                 is_valid, reason = validate_episode_cache(
-                    output_path, episode, compatibility
+                    output_path, episode, compatibility,
+                    allow_pending=summary_allows_pending,
+                    check_finite=args.audit_only,
                 )
                 if is_valid:
                     suite_completed += 1
@@ -515,7 +813,9 @@ def main():
                 "completed_episodes": suite_completed,
                 "anchors": suite_anchors,
                 "bytes": suite_bytes,
-                "feature_directory": FEATURE_DIRECTORY,
+                "feature_directory": confidence_feature_directory(args.num_teacher_samples) if args.confidence_aware else FEATURE_DIRECTORY,
+                "confidence_aware": args.confidence_aware,
+                "num_teacher_samples": args.num_teacher_samples if args.confidence_aware else 1,
                 "world_size": world_size,
                 "smoke_test": args.smoke_test,
                 "audit_only": args.audit_only,
