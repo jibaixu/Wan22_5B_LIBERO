@@ -217,7 +217,7 @@ def cache_compatibility_metadata(
 
 def confidence_cache_metadata(
     episode, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples,
-    complete=False, calibration=None,
+    complete=False, calibration=None, calibration_scope=None,
 ):
     metadata = cache_compatibility_metadata(
         episode, checkpoint_path, checkpoint_hash, base_seed,
@@ -257,12 +257,15 @@ def confidence_cache_metadata(
         }
     )
     if calibration:
+        if calibration_scope is None:
+            calibration_scope = "suite_training_episodes"
         metadata.update(
             {
                 "calibration_q_low": f"{calibration['q_low']:.9g}",
                 "calibration_q_high": f"{calibration['q_high']:.9g}",
                 "calibration_eps": f"{calibration['eps']:.9g}",
-                "calibration_scope": "all_training_episodes",
+                "calibration_scope": calibration_scope,
+                "calibration_suite": episode["suite"],
             }
         )
     return metadata
@@ -290,6 +293,13 @@ def episode_output_path(episode, output_root=None, confidence_aware=False, num_t
         feature_root = Path(output_root).expanduser().resolve() / episode["suite"] / directory
     chunk_id = episode["episode_index"] // episode["chunks_size"]
     return feature_root / f"chunk-{chunk_id:03d}" / f"episode_{episode['episode_index']:06d}.safetensors"
+
+
+def confidence_manifest_path(episode, output_root=None, num_teacher_samples=4):
+    return episode_output_path(
+        episode, output_root, confidence_aware=True,
+        num_teacher_samples=num_teacher_samples,
+    ).parents[1] / "confidence_manifest.json"
 
 
 def read_anchor_image(reader, anchor_frame):
@@ -401,6 +411,10 @@ def extract_episode(
 
 
 def finalize_confidence_cache(episodes, output_root, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples, manifest_path):
+    suites = {episode["suite"] for episode in episodes}
+    if len(suites) != 1:
+        raise ValueError("Confidence calibration requires episodes from exactly one suite")
+    suite = next(iter(suites))
     paths = [episode_output_path(e, output_root, True, num_teacher_samples) for e in episodes]
     missing = [str(path) for path in paths if not path.is_file()]
     if missing:
@@ -429,6 +443,7 @@ def finalize_confidence_cache(episodes, output_root, checkpoint_path, checkpoint
         metadata.update(confidence_cache_metadata(
             episode, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples,
             complete=True, calibration=calibration,
+            calibration_scope="suite_training_episodes",
         ))
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.unlink(missing_ok=True)
@@ -444,7 +459,8 @@ def finalize_confidence_cache(episodes, output_root, checkpoint_path, checkpoint
         "confidence_aware": True, "confidence_version": "v1",
         "num_teacher_samples": int(num_teacher_samples),
         "calibration": "train_quantile_05_95",
-        "calibration_scope": "all_training_episodes", "q_low": q_low,
+        "calibration_scope": "suite_training_episodes", "suite": suite,
+        "q_low": q_low,
         "q_high": q_high, "eps": calibration["eps"],
         "episode_count": len(paths), "anchor_count": int(raw.numel()),
         "checkpoint_path": checkpoint_path, "checkpoint_sha256": checkpoint_hash,
@@ -552,6 +568,14 @@ def filter_episodes(indexed_episodes, args):
             continue
         selected.append((ordinal, episode))
     return selected
+
+
+def has_episode_filter(args):
+    return (
+        args.episode_start is not None
+        or args.episode_end is not None
+        or args.episode_indices is not None
+    )
 
 
 def main():
@@ -682,50 +706,75 @@ def main():
     if world_size > 1:
         dist.barrier()
 
-    global_confidence_run = (
+    suite_confidence_run = (
         args.confidence_aware
-        and args.suites is None
-        and args.episode_start is None
-        and args.episode_end is None
-        and args.episode_indices is None
+        and not has_episode_filter(args)
         and not args.dry_run
         and not args.audit_only
     )
-    calibration = None
-    if rank == 0 and global_confidence_run:
-        manifest_path = (
-            Path(args.output_root).expanduser().resolve() / "confidence_manifest.json"
-            if args.output_root
-            else progress_dir / "confidence_manifest.json"
-        )
-        finalized = manifest_path.is_file()
-        if finalized:
-            for episode in episodes:
-                path = episode_output_path(
-                    episode, args.output_root, True, args.num_teacher_samples
-                )
-                compatibility = cache_compatibility_metadata(
-                    episode, checkpoint_path, checkpoint_hash, args.base_seed,
-                    confidence_aware=True,
-                    num_teacher_samples=args.num_teacher_samples,
-                )
-                valid_cache, _ = validate_episode_cache(path, episode, compatibility)
-                if not valid_cache:
-                    finalized = False
-                    break
-        if finalized:
-            with open(manifest_path, "r", encoding="utf-8") as file:
-                calibration = json.load(file)
-        else:
-            calibration = finalize_confidence_cache(
-                episodes,
-                args.output_root,
-                checkpoint_path,
-                checkpoint_hash,
-                args.base_seed,
-                args.num_teacher_samples,
-                manifest_path,
+    calibrations = {}
+    if rank == 0 and suite_confidence_run:
+        selected_suites = sorted({episode["suite"] for _, episode in selected})
+        for suite in selected_suites:
+            suite_episodes = [
+                episode for episode in episodes if episode["suite"] == suite
+            ]
+            manifest_path = confidence_manifest_path(
+                suite_episodes[0], args.output_root, args.num_teacher_samples
             )
+            finalized = manifest_path.is_file()
+            if finalized:
+                for episode in suite_episodes:
+                    path = episode_output_path(
+                        episode, args.output_root, True, args.num_teacher_samples
+                    )
+                    compatibility = cache_compatibility_metadata(
+                        episode, checkpoint_path, checkpoint_hash, args.base_seed,
+                        confidence_aware=True,
+                        num_teacher_samples=args.num_teacher_samples,
+                    )
+                    valid_cache, _ = validate_episode_cache(path, episode, compatibility)
+                    if not valid_cache:
+                        finalized = False
+                        break
+                    with safe_open(path, framework="pt", device="cpu") as file:
+                        metadata = file.metadata() or {}
+                    if (
+                        metadata.get("calibration_scope")
+                        != "suite_training_episodes"
+                        or metadata.get("calibration_suite") != suite
+                    ):
+                        finalized = False
+                        break
+                if finalized:
+                    with open(manifest_path, "r", encoding="utf-8") as file:
+                        manifest = json.load(file)
+                    if (
+                        manifest.get("suite") != suite
+                        or manifest.get("calibration_scope")
+                        != "suite_training_episodes"
+                    ):
+                        finalized = False
+            if finalized:
+                calibrations[suite] = {
+                    **manifest, "manifest_path": str(manifest_path),
+                }
+            else:
+                calibration = finalize_confidence_cache(
+                    suite_episodes,
+                    args.output_root,
+                    checkpoint_path,
+                    checkpoint_hash,
+                    args.base_seed,
+                    args.num_teacher_samples,
+                    manifest_path,
+                )
+                calibrations[suite] = {
+                    **calibration,
+                    "suite": suite,
+                    "calibration_scope": "suite_training_episodes",
+                    "manifest_path": str(manifest_path),
+                }
     if world_size > 1:
         dist.barrier()
 
@@ -733,7 +782,7 @@ def main():
         summary_allows_pending = (
             args.confidence_aware
             and not args.audit_only
-            and not global_confidence_run
+            and not suite_confidence_run
         )
         rank_progress = []
         for rank_id in range(world_size):
@@ -753,7 +802,7 @@ def main():
             "feature_directory": confidence_feature_directory(args.num_teacher_samples) if args.confidence_aware else FEATURE_DIRECTORY,
             "confidence_aware": args.confidence_aware,
             "num_teacher_samples": args.num_teacher_samples if args.confidence_aware else 1,
-            "calibration": calibration,
+            "calibrations": calibrations,
             "world_size": world_size,
             "smoke_test": args.smoke_test,
             "audit_only": args.audit_only,
@@ -816,6 +865,7 @@ def main():
                 "feature_directory": confidence_feature_directory(args.num_teacher_samples) if args.confidence_aware else FEATURE_DIRECTORY,
                 "confidence_aware": args.confidence_aware,
                 "num_teacher_samples": args.num_teacher_samples if args.confidence_aware else 1,
+                "calibration": calibrations.get(suite),
                 "world_size": world_size,
                 "smoke_test": args.smoke_test,
                 "audit_only": args.audit_only,

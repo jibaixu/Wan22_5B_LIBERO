@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 
@@ -33,8 +34,11 @@ from extract_libero_future_features import (  # noqa: E402
     _FeatureSampleAccumulator,
     cache_metadata,
     confidence_cache_metadata,
+    confidence_manifest_path,
     expected_anchor_frames,
     expected_valid_future_frames,
+    finalize_confidence_cache,
+    has_episode_filter,
     validate_episode_cache,
 )
 from diffsynth.diffusion.base_pipeline import PipelineUnit  # noqa: E402
@@ -201,6 +205,98 @@ class TestCacheValidation(unittest.TestCase):
         )
         self.write(tensors, finalized)
         self.assertTrue(validate_episode_cache(self.path, self.episode, finalized)[0])
+        self.assertEqual(finalized["calibration_scope"], "suite_training_episodes")
+        self.assertEqual(finalized["calibration_suite"], "libero_goal")
+
+    def test_suite_calibration_uses_only_its_own_disagreements(self):
+        checkpoint_path = "/tmp/checkpoint.safetensors"
+        checkpoint_hash = "abc"
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_root = Path(temporary_dir)
+            episodes = [
+                {
+                    "suite": "libero_goal", "suite_id": 1,
+                    "episode_index": 0, "episode_length": 17,
+                    "chunks_size": 1000,
+                },
+                {
+                    "suite": "libero_spatial", "suite_id": 2,
+                    "episode_index": 0, "episode_length": 17,
+                    "chunks_size": 1000,
+                },
+            ]
+            disagreements = {
+                "libero_goal": torch.tensor([0.0, 1.0, 2.0]),
+                "libero_spatial": torch.tensor([10.0, 11.0, 12.0]),
+            }
+            tensors = {
+                "features": torch.zeros((3, 1125, 3072), dtype=torch.bfloat16),
+                "anchor_frames": expected_anchor_frames(17),
+                "valid_future_frames": expected_valid_future_frames(
+                    17, expected_anchor_frames(17)
+                ),
+                "confidence": torch.ones(3, dtype=torch.float32),
+            }
+            for episode in episodes:
+                path = (
+                    output_root / episode["suite"]
+                    / "wan2_2_future_latent_h16_step20_block20z_stride8_480x480_samples4_confv1"
+                    / "chunk-000" / "episode_000000.safetensors"
+                )
+                path.parent.mkdir(parents=True)
+                save_file(
+                    {**tensors, "disagreement": disagreements[episode["suite"]]},
+                    path,
+                    metadata={
+                        **confidence_cache_metadata(
+                            episode, checkpoint_path, checkpoint_hash, 42, 4,
+                            complete=True,
+                            calibration={"q_low": 0.0, "q_high": 12.0, "eps": 1e-8},
+                            calibration_scope="all_training_episodes",
+                        ),
+                        "calibration_suite": "all_suites",
+                    },
+                )
+
+            calibrations = {}
+            for episode in episodes:
+                manifest_path = confidence_manifest_path(episode, output_root, 4)
+                calibrations[episode["suite"]] = finalize_confidence_cache(
+                    [episode], output_root, checkpoint_path, checkpoint_hash, 42, 4,
+                    manifest_path,
+                )
+                with open(manifest_path, encoding="utf-8") as file:
+                    manifest = json.load(file)
+                self.assertEqual(manifest["suite"], episode["suite"])
+                self.assertEqual(
+                    manifest["calibration_scope"], "suite_training_episodes"
+                )
+                with safe_open(
+                    output_root / episode["suite"]
+                    / "wan2_2_future_latent_h16_step20_block20z_stride8_480x480_samples4_confv1"
+                    / "chunk-000" / "episode_000000.safetensors",
+                    framework="pt", device="cpu",
+                ) as file:
+                    metadata = file.metadata() or {}
+                self.assertEqual(metadata["calibration_scope"], "suite_training_episodes")
+                self.assertEqual(metadata["calibration_suite"], episode["suite"])
+
+            self.assertLess(calibrations["libero_goal"]["q_high"], 3.0)
+            self.assertGreater(calibrations["libero_spatial"]["q_low"], 9.0)
+
+    def test_episode_filters_are_the_only_calibration_blockers(self):
+        base = {
+            "episode_start": None, "episode_end": None, "episode_indices": None,
+        }
+        self.assertFalse(has_episode_filter(types.SimpleNamespace(**base)))
+        for key, value in (
+            ("episode_start", 0),
+            ("episode_end", 8),
+            ("episode_indices", [1, 2]),
+        ):
+            with self.subTest(key=key):
+                filtered = {**base, key: value}
+                self.assertTrue(has_episode_filter(types.SimpleNamespace(**filtered)))
 
     def test_streaming_disagreement_matches_explicit_pairs(self):
         samples = [torch.randn(5, 7) for _ in range(4)]

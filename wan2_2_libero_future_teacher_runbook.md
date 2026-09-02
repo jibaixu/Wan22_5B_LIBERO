@@ -4,7 +4,7 @@
 
 ### Confidence-aware future teacher
 
-正式 future teacher 抽取使用 `--confidence-aware --num-teacher-samples 4`。每个 anchor 的四次推理只改变显式 diffusion seed，抽取器以 float32 流式累加器保存均值 feature 和 token-level pairwise cosine disagreement，不写入四份中间 feature。分片运行会先写 `complete=false, calibration=pending` 的缓存；无 episode 过滤的全量重跑会从全量训练 episode 的 disagreement 计算 q05/q95，并原子重写 `confidence`、`complete=true` 及 `confidence_manifest.json`。
+正式 future teacher 抽取使用 `--confidence-aware --num-teacher-samples 4`。每个 anchor 的四次推理只改变显式 diffusion seed，抽取器以 float32 流式累加器保存均值 feature 和 token-level pairwise cosine disagreement，不写入四份中间 feature。分片运行会先写 `complete=false, calibration=pending` 的缓存；没有 episode 范围或索引过滤的运行会按 suite 分别从该 suite 全部训练 episode 的 disagreement 计算 q05/q95，并原子重写各自的 `confidence`、`complete=true` 及 suite-local `confidence_manifest.json`。不传 `--suites` 时仍一次处理四个 suite，但不会混合它们的 calibration；传入 `--suites` 时会校准每个选中 suite。
 
 confidence-aware 缓存目录为 `wan2_2_future_latent_h16_step20_block20z_stride8_480x480_samples4_confv1`，新增 tensor 为 `confidence [A] float32` 和 `disagreement [A] float32`。旧目录仍保留为 legacy 单次 target，不能与 confidence-aware 缓存混用。
 
@@ -431,6 +431,8 @@ ${DATA_ROOT}/libero_spatial_no_noops_1.0.0_lerobot/
   wan2_2_future_latent_h16_step20_block20z_stride8_480x480/
 ```
 
+confidence-aware 模式下，每个 suite 的 `wan2_2_future_latent_h16_step20_block20z_stride8_480x480_samples4_confv1/` 目录还会包含该 suite 专属的 `confidence_manifest.json`。已有全局 calibration 缓存可直接用完整 suite 运行原地重校准，复用已保存的 `disagreement`，不会重新跑 teacher。
+
 全局进度位于：
 
 ```text
@@ -448,7 +450,7 @@ ${RUN_ROOT}/extraction_progress/extraction_summary.json
 
 ### 10.2 定向重算某些 episode
 
-目的：只修复指定 suite/episode，同时强制覆盖已有文件。
+目的：只修复指定 suite/episode，同时强制覆盖已有文件。该命令只产生 pending confidence 缓存；完成全部修复后，使用不带 episode filter 的完整 suite 运行进行最终校准。
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \

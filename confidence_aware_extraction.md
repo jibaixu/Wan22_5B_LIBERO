@@ -89,21 +89,22 @@ calibration=train_quantile_05_95
 
 ## Confidence 校准
 
-当前 LIBERO 流程中所有发现的 episode 都作为训练数据使用，没有独立 validation split。因此无过滤的全量运行会收集全部 episode 的 `disagreement`，计算全局 q05/q95：
+LIBERO 的四个 task suite 使用彼此独立的 confidence 尺度。没有 episode 过滤的运行会把每个选中 suite 的全部 episode 作为一个校准单元：不传 `--suites` 时一次处理四个 suite，并分别计算四组 q05/q95；传入一个或多个 `--suites` 时，也分别对每个选中 suite 的完整 episode 集校准。
 
 ```text
 r = clip((disagreement - q05) / (q95 - q05 + 1e-8), 0, 1)
 confidence = 1 - r
 ```
 
-校准参数写入 `confidence_manifest.json`，内容包括：
+每套校准参数写入对应 suite 的 confidence feature 目录中的 `confidence_manifest.json`。默认输出时位于 `<suite-root>/<confidence-feature-directory>/confidence_manifest.json`；使用 `--output-root` 时位于 `<output-root>/<suite>/<confidence-feature-directory>/confidence_manifest.json`。内容包括：
 
 ```text
 confidence_aware
 confidence_version
 num_teacher_samples
 calibration
-calibration_scope=all_training_episodes
+suite
+calibration_scope=suite_training_episodes
 q_low
 q_high
 eps
@@ -113,7 +114,7 @@ checkpoint_path
 checkpoint_sha256
 ```
 
-不能对单独 shard 使用局部分位数作为正式 confidence。带 `--suites`、`--episode-start`、`--episode-end` 或 `--episode-indices` 的运行只负责抽取 feature/disagreement，不进行全局校准。
+不能对单独 episode shard 使用局部分位数作为正式 confidence。带 `--episode-start`、`--episode-end` 或 `--episode-indices` 的运行只负责抽取 feature/disagreement，不进行 confidence 校准；`--suites` 仅选择完整 suite 校准单元，不会阻止校准。
 
 ## 中断恢复与跳过规则
 
@@ -125,10 +126,12 @@ checkpoint_sha256
 - `--overwrite` 强制重新抽取所有选中的文件；
 - 如果进程在单个 episode 完成前中断，该 episode 按文件粒度整体重算，不支持从单个 anchor 的中间状态继续。
 
-无过滤的 confidence-aware 全量命令会在抽取阶段结束后检查 `confidence_manifest.json`：
+不带 episode 过滤的 confidence-aware 运行会在抽取阶段结束后逐 suite 检查对应的 `confidence_manifest.json`：
 
-- manifest 和所有 episode 都已 finalized：只校验并跳过，不重复校准；
-- manifest 缺失或任一 episode 未 finalized：重新收集 raw disagreement 并原子重写全部 episode。
+- manifest 和该 suite 的所有 episode 都已 finalized：只校验并跳过，不重复校准；
+- manifest 缺失、校准范围不是 suite 级，或该 suite 任一 episode 未 finalized：重新收集该 suite 的 raw disagreement，并原子重写该 suite 的全部 episode。
+
+已有 `confv1` 的全局 confidence 缓存可以直接原地迁移：首次按上述方式运行完整 suite 时会复用已有 `disagreement`，重写 suite 独立的 confidence、metadata 和 suite-local manifest，不重新执行 teacher 推理。
 
 因此，分片任务中断后可以直接重启同样的命令；所有合法 safetensor 会被跳过，剩余 episode 才会加载 Wan 模型并执行推理。
 
