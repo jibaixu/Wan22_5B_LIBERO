@@ -98,8 +98,98 @@ class TestManifestAndDataset(unittest.TestCase):
             self.assertTrue(all(image.mode == "RGB" for image in sample["video"]))
             self.assertTrue(all(image.size == (480, 480) for image in sample["video"]))
             reference = np.asarray(sample["video"][0])
-            self.assertTrue(all(np.array_equal(reference, np.asarray(image)) for image in sample["video"][1:]))
+            self.assertTrue(
+                all(
+                    np.array_equal(reference, np.asarray(image))
+                    for image in sample["video"][1:]
+                )
+            )
             dataset.close()
+
+
+class TestEpisodeSplit(unittest.TestCase):
+    def _episodes(self):
+        episodes = []
+        for episode_index in range(10):
+            episodes.append(
+                {
+                    "suite": "robotwin_clean_demo",
+                    "task_id": "sort_blocks",
+                    "prompt": f"Arrange blocks, variant {episode_index}",
+                    "episode_index": episode_index,
+                }
+            )
+        for episode_index in range(4):
+            episodes.append(
+                {
+                    "suite": "robotwin_randomized_demo",
+                    "task_id": "sort_blocks",
+                    "prompt": f"Randomized arrangement {episode_index}",
+                    "episode_index": episode_index,
+                }
+            )
+        return episodes
+
+    def test_groups_by_task_id_when_prompts_vary(self):
+        episodes = self._episodes()
+        train, val = split_episodes(episodes, val_ratio=0.1, split_seed=42)
+        val_keys = {(row["suite"], row["episode_index"]) for row in val}
+        self.assertEqual(len(val), 2)
+        self.assertEqual(
+            {suite for suite, _ in val_keys},
+            {"robotwin_clean_demo", "robotwin_randomized_demo"},
+        )
+        self.assertFalse(
+            {(row["suite"], row["episode_index"]) for row in train}
+            & val_keys
+        )
+
+    def test_single_episode_task_stays_in_train(self):
+        episodes = [
+            {
+                "suite": "robotwin_clean_demo",
+                "task_id": "single_episode_task",
+                "prompt": "A changing prompt",
+                "episode_index": 0,
+            },
+            {
+                "suite": "robotwin_clean_demo",
+                "task_id": "multi_episode_task",
+                "prompt": "Another prompt",
+                "episode_index": 1,
+            },
+            {
+                "suite": "robotwin_clean_demo",
+                "task_id": "multi_episode_task",
+                "prompt": "Yet another prompt",
+                "episode_index": 2,
+            },
+        ]
+        train, val = split_episodes(episodes, val_ratio=0.5, split_seed=42)
+        self.assertIn(0, [row["episode_index"] for row in train])
+        self.assertNotIn(0, [row["episode_index"] for row in val])
+
+    def test_robotwin_suite_fallback_groups_varying_prompts(self):
+        episodes = [
+            {
+                "suite": "robotwin_clean_blocks_ranking_rgb",
+                "prompt": f"Prompt variant {episode_index}",
+                "episode_index": episode_index,
+            }
+            for episode_index in range(10)
+        ]
+        train, val = split_episodes(episodes, val_ratio=0.1, split_seed=42)
+        self.assertEqual(len(val), 1)
+        self.assertEqual(len(train), 9)
+
+    def test_legacy_prompt_fallback_is_reproducible(self):
+        episodes = [
+            {"suite": "libero_goal", "prompt": "task a", "episode_index": i}
+            for i in range(5)
+        ]
+        first = split_episodes(episodes, val_ratio=0.2, split_seed=42)
+        second = split_episodes(episodes, val_ratio=0.2, split_seed=42)
+        self.assertEqual(first, second)
 
 
 class TestCacheValidation(unittest.TestCase):

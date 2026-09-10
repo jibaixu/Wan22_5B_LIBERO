@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sys
+import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,22 +30,57 @@ def _split_score(seed, suite, task, episode_index):
     return hashlib.sha256(value).digest()
 
 
+def _episode_task_id(episode):
+    """Return the stable task identifier used for stratified splitting.
+
+    RoboTwin manifests carry ``task_id`` (and usually ``tasks``), while older
+    LIBERO manifests only have a prompt.  Prompts are deliberately the last
+    fallback because RoboTwin prompts can vary between episodes of one task.
+    """
+    task_id = episode.get("task_id")
+    if task_id is not None and str(task_id).strip():
+        return str(task_id)
+
+    tasks = episode.get("tasks")
+    if isinstance(tasks, (list, tuple)) and tasks:
+        task_id = tasks[0]
+        if task_id is not None and str(task_id).strip():
+            return str(task_id)
+
+    suite = episode.get("suite")
+    if suite is not None and str(suite).startswith("robotwin_"):
+        return str(suite)
+
+    prompt = episode.get("prompt")
+    if prompt is None:
+        raise KeyError("episode manifest row must contain task_id, tasks, or prompt")
+    return str(prompt)
+
+
 def split_episodes(episodes, val_ratio=0.1, split_seed=42):
     groups = defaultdict(list)
     for episode in episodes:
-        groups[(episode["suite"], episode["prompt"])].append(episode)
+        task_id = _episode_task_id(episode)
+        groups[(episode["suite"], task_id)].append(episode)
 
     val_keys = set()
-    for (suite, task), rows in sorted(groups.items()):
+    for (suite, task_id), rows in sorted(groups.items()):
         rows = sorted(
             rows,
             key=lambda row: _split_score(
-                split_seed, suite, task, row["episode_index"]
+                split_seed, suite, task_id, row["episode_index"]
             ),
         )
-        num_val = max(1, math.floor(len(rows) * val_ratio + 0.5))
-        if num_val >= len(rows):
-            raise ValueError(f"Validation split consumes stratum {(suite, task)!r}")
+        if len(rows) == 1:
+            warnings.warn(
+                f"Task stratum {(suite, task_id)!r} has one episode; keeping it in train",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            num_val = 0
+        else:
+            requested_val = max(1, math.floor(len(rows) * val_ratio + 0.5))
+            num_val = min(requested_val, len(rows) - 1)
         val_keys.update((row["suite"], row["episode_index"]) for row in rows[:num_val])
 
     train = []
