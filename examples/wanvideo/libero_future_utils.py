@@ -13,7 +13,12 @@ FEATURE_DIRECTORY = "wan2_2_future_latent_h16_step20_block20z_stride8_480x480"
 
 def confidence_feature_directory(num_teacher_samples=4):
     """Directory name for mean-target, confidence-aware future features."""
-    return f"{FEATURE_DIRECTORY}_samples{int(num_teacher_samples)}_confv1"
+    suffix = f"_samples{int(num_teacher_samples)}_confv1"
+    # Callers may pass an already-versioned directory name through
+    # ``--feature-directory``.  Do not append the confidence suffix twice;
+    # doing so silently puts extracted caches in a path different from the
+    # one used by the training configuration.
+    return FEATURE_DIRECTORY if FEATURE_DIRECTORY.endswith(suffix) else f"{FEATURE_DIRECTORY}{suffix}"
 
 
 def wan_model_configs():

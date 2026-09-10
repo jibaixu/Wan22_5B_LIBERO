@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -72,6 +73,30 @@ REQUIRED_METADATA = {
 }
 
 
+def load_teacher_projection(path):
+    if not path:
+        return None
+    with safe_open(str(path), framework="pt", device="cpu") as reader:
+        mean = reader.get_tensor("mean").float().contiguous()
+        components = reader.get_tensor("components").float().contiguous()
+        metadata = reader.metadata() or {}
+    if mean.ndim != 1 or components.ndim != 2 or components.shape[1] != mean.numel():
+        raise ValueError(f"Invalid teacher projection shapes: {tuple(mean.shape)}, {tuple(components.shape)}")
+    digest = hashlib.sha256(mean.numpy().tobytes() + components.numpy().tobytes()).hexdigest()
+    if metadata.get("projection_sha256") and metadata["projection_sha256"] != digest:
+        raise ValueError(f"Teacher projection hash mismatch: {metadata['projection_sha256']} != {digest}")
+    return mean, components, digest
+
+
+def project_teacher_feature(feature, projection):
+    if projection is None:
+        return feature
+    mean, components, _ = projection
+    if feature.ndim != 2 or feature.shape[-1] != mean.numel():
+        raise ValueError(f"Teacher feature shape {tuple(feature.shape)} does not match projection input {mean.numel()}")
+    return ((feature.float() - mean) @ components.T).to(torch.bfloat16).contiguous()
+
+
 def git_commit():
     try:
         return subprocess.check_output(
@@ -81,12 +106,16 @@ def git_commit():
         return "unknown"
 
 
-def expected_anchor_frames(episode_length):
-    return torch.arange(0, episode_length, 8, dtype=torch.int64)
+def expected_anchor_frames(episode_length, share_stride=8):
+    return torch.arange(0, episode_length, share_stride, dtype=torch.int64)
 
 
-def expected_valid_future_frames(episode_length, anchors):
-    return torch.clamp(episode_length - 1 - anchors, min=0, max=16).to(torch.int16)
+def expected_valid_future_frames(episode_length, anchors, effective_future_steps=16):
+    return torch.clamp(episode_length - 1 - anchors, min=0, max=effective_future_steps).to(torch.int16)
+
+
+def future_frame_ids(anchor_frame, episode_length, num_frames=17, temporal_stride=1):
+    return [min(anchor_frame + index * temporal_stride, episode_length - 1) for index in range(num_frames)]
 
 
 def validate_episode_cache(
@@ -120,14 +149,17 @@ def validate_episode_cache(
             elif metadata.get("complete") != "true":
                 return False, "cache is incomplete"
 
-            expected_anchors = expected_anchor_frames(int(episode["episode_length"]))
+            expected_anchors = expected_anchor_frames(
+                int(episode["episode_length"]), int(episode.get("teacher_share_stride", 8))
+            )
             expected_valid = expected_valid_future_frames(
-                int(episode["episode_length"]), expected_anchors
+                int(episode["episode_length"]), expected_anchors,
+                16 * int(episode.get("teacher_temporal_stride", 1)),
             )
             feature_slice = file.get_slice("features")
             anchor_slice = file.get_slice("anchor_frames")
             valid_slice = file.get_slice("valid_future_frames")
-            expected_feature_shape = [len(expected_anchors), 1125, 3072]
+            expected_feature_shape = [len(expected_anchors), 1125, int(episode.get("teacher_feature_dim", 3072))]
             if feature_slice.get_shape() != expected_feature_shape:
                 return False, "feature shape mismatch"
             if feature_slice.get_dtype() != "BF16":
@@ -179,7 +211,7 @@ def cache_compatibility_metadata(
     episode, checkpoint_path, checkpoint_hash, base_seed,
     confidence_aware=False, num_teacher_samples=4,
 ):
-    anchors = expected_anchor_frames(episode["episode_length"])
+    anchors = expected_anchor_frames(episode["episode_length"], int(episode.get("teacher_share_stride", 8)))
     seeds = [
         teacher_seed(
             base_seed,
@@ -190,6 +222,28 @@ def cache_compatibility_metadata(
         for anchor in anchors.tolist()
     ]
     metadata = dict(REQUIRED_METADATA)
+    if episode.get("dataset_format") == "robotwin":
+        temporal_stride = int(episode.get("teacher_temporal_stride", 3))
+        metadata.update({
+            "dataset_format": "robotwin",
+            "fps": str(episode.get("fps", 15)),
+            "video_key": str(episode.get("video_key", "observation.images.image")),
+            "prompt_source": "robotwin_teacher_manifest",
+            "share_stride": str(episode.get("teacher_share_stride", 1)),
+            "temporal_stride": str(temporal_stride),
+            "effective_future_steps": str(16 * temporal_stride),
+            "future_horizon_frames": str(16 * temporal_stride),
+        })
+    if episode.get("teacher_feature_dim") is not None:
+        metadata["feature_dim"] = str(episode["teacher_feature_dim"])
+    if episode.get("teacher_projection_sha256"):
+        metadata.update({
+            "feature_transform": "tokenwise_pca_v1",
+            "projection_sha256": str(episode["teacher_projection_sha256"]),
+            "projection_input_dim": "3072",
+            "projection_output_dim": str(episode["teacher_feature_dim"]),
+            "source_feature_dim": "3072",
+        })
     metadata.update(
         {
             "checkpoint_path": checkpoint_path,
@@ -250,7 +304,9 @@ def confidence_cache_metadata(
                         )
                         for sample_index in range(int(num_teacher_samples))
                     ]
-                    for anchor in expected_anchor_frames(episode["episode_length"]).tolist()
+                    for anchor in expected_anchor_frames(
+                        episode["episode_length"], int(episode.get("teacher_share_stride", 8))
+                    ).tolist()
                 ],
                 separators=(",", ":"),
             ),
@@ -287,7 +343,12 @@ def cache_metadata(episode, checkpoint_path, checkpoint_hash, base_seed):
 
 def episode_output_path(episode, output_root=None, confidence_aware=False, num_teacher_samples=4):
     directory = confidence_feature_directory(num_teacher_samples) if confidence_aware else FEATURE_DIRECTORY
-    if output_root is None:
+    if episode.get("dataset_format") == "robotwin":
+        # A manifest row already points at its task-local LeRobot root.  Keep
+        # each task's cache beside its source video; otherwise one global
+        # output root would mix episode indices from different tasks.
+        feature_root = Path(episode["dataset_root"]) / directory
+    elif output_root is None:
         feature_root = Path(episode["dataset_root"]) / directory
     else:
         feature_root = Path(output_root).expanduser().resolve() / episode["suite"] / directory
@@ -305,6 +366,12 @@ def confidence_manifest_path(episode, output_root=None, num_teacher_samples=4):
 def read_anchor_image(reader, anchor_frame):
     image = Image.fromarray(reader.get_data(anchor_frame)).convert("RGB")
     return image.resize((480, 480), resample=Image.Resampling.BILINEAR)
+
+
+def read_future_clip(reader, anchor_frame, episode_length, num_frames, temporal_stride):
+    """Read the exact sparse clip used by the future-teacher contract."""
+    frame_ids = future_frame_ids(anchor_frame, episode_length, num_frames, temporal_stride)
+    return [read_anchor_image(reader, frame_id) for frame_id in frame_ids]
 
 
 class _FeatureSampleAccumulator:
@@ -351,16 +418,19 @@ class _FeatureSampleAccumulator:
 
 def extract_episode(
     pipe, episode, checkpoint_path, checkpoint_hash, base_seed, output_path,
-    confidence_aware=False, num_teacher_samples=4,
+    confidence_aware=False, num_teacher_samples=4, share_stride=8, temporal_stride=1,
+    projection=None,
 ):
-    anchors = expected_anchor_frames(episode["episode_length"])
-    valid = expected_valid_future_frames(episode["episode_length"], anchors)
+    anchors = expected_anchor_frames(episode["episode_length"], share_stride)
+    valid = expected_valid_future_frames(episode["episode_length"], anchors, 16 * temporal_stride)
     features = []
     disagreements = []
     reader = imageio.get_reader(episode["video_path"])
     try:
         for anchor in anchors.tolist():
-            image = read_anchor_image(reader, anchor)
+            clip = read_future_clip(
+                reader, anchor, episode["episode_length"], 17, temporal_stride
+            )
             accumulator = _FeatureSampleAccumulator()
             sample_count = num_teacher_samples if confidence_aware else 1
             for sample_index in range(sample_count):
@@ -369,7 +439,7 @@ def extract_episode(
                     anchor, sample_index,
                 )
                 result = pipe.extract_dit_feature(
-                    prompt=episode["prompt"], input_image=image, height=480,
+                    prompt=episode["prompt"], input_video=clip, height=480,
                     width=480, num_frames=17, seed=seed, num_inference_steps=20,
                     sigma_shift=5.0, cfg_scale=5.0, negative_prompt="",
                     rand_device="cpu", tiled=False, capture=WanFeatureCaptureSpec(),
@@ -377,7 +447,7 @@ def extract_episode(
                 accumulator.add(result.feature)
                 del result
             mean_feature, disagreement = accumulator.finalize()
-            features.append(mean_feature.to(dtype=torch.bfloat16))
+            features.append(project_teacher_feature(mean_feature, projection))
             disagreements.append(disagreement)
             del accumulator, mean_feature, disagreement
     finally:
@@ -524,6 +594,12 @@ def parse_args():
     )
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--checkpoint-type", choices=("lora", "full"), default="lora")
+    parser.add_argument("--projection", default=None, help="Optional token-wise PCA safetensors projection.")
+    parser.add_argument("--manifest", default=None, help="Canonical RoboTwin teacher JSONL manifest.")
+    parser.add_argument("--task-id", default=None)
+    parser.add_argument("--feature-directory", default=None)
+    parser.add_argument("--share-stride", type=int, default=8)
+    parser.add_argument("--temporal-stride", type=int, default=1)
     parser.add_argument("--output-root", default=None)
     parser.add_argument(
         "--progress-dir",
@@ -579,19 +655,38 @@ def has_episode_filter(args):
 
 
 def main():
+    global FEATURE_DIRECTORY
     args = parse_args()
+    projection = load_teacher_projection(args.projection)
+    if args.feature_directory:
+        FEATURE_DIRECTORY = str(args.feature_directory)
     if args.audit_only and args.overwrite:
         raise ValueError("--audit-only and --overwrite cannot be used together")
     if args.num_teacher_samples < 1:
         raise ValueError("--num-teacher-samples must be positive")
     if args.confidence_aware and args.num_teacher_samples < 2:
         raise ValueError("--confidence-aware requires --num-teacher-samples >= 2")
+    if args.share_stride <= 0 or args.temporal_stride <= 0:
+        raise ValueError("--share-stride and --temporal-stride must be positive")
     rank, local_rank, world_size = init_distributed()
     checkpoint_path = absolute_checkpoint_path(args.checkpoint_path)
     if not Path(checkpoint_path).is_file():
         raise FileNotFoundError(checkpoint_path)
 
-    episodes = discover_libero_episodes(args.data_root)
+    if args.manifest:
+        episodes = [json.loads(line) for line in Path(args.manifest).read_text(encoding="utf-8").splitlines() if line.strip()]
+        if args.task_id is not None:
+            episodes = [episode for episode in episodes if episode.get("task_id") == args.task_id]
+        for suite_id, episode in enumerate(episodes):
+            episode["suite_id"] = suite_id
+            episode["dataset_format"] = "robotwin"
+            episode["teacher_share_stride"] = args.share_stride
+            episode["teacher_temporal_stride"] = args.temporal_stride
+            if projection is not None:
+                episode["teacher_feature_dim"] = int(projection[1].shape[0])
+                episode["teacher_projection_sha256"] = projection[2]
+    else:
+        episodes = discover_libero_episodes(args.data_root)
     selected = filter_episodes(list(enumerate(episodes)), args)
     if not selected:
         raise ValueError("Episode filters selected no work")
@@ -664,7 +759,7 @@ def main():
             if is_valid:
                 progress["skipped_episodes"] += 1
                 progress["completed_episodes"] += 1
-                progress["anchors"] += math.ceil(episode["episode_length"] / 8)
+                progress["anchors"] += math.ceil(episode["episode_length"] / args.share_stride)
                 progress["bytes"] += output_path.stat().st_size
                 atomic_json(progress_path, progress)
                 continue
@@ -691,6 +786,9 @@ def main():
             output_path,
             confidence_aware=args.confidence_aware,
             num_teacher_samples=args.num_teacher_samples,
+            share_stride=args.share_stride,
+            temporal_stride=args.temporal_stride,
+            projection=projection,
         )
         progress["completed_episodes"] += 1
         progress["anchors"] += anchors
@@ -837,7 +935,9 @@ def main():
                 )
                 if is_valid:
                     suite_completed += 1
-                    suite_anchors += math.ceil(episode["episode_length"] / 8)
+                    suite_anchors += math.ceil(
+                        episode["episode_length"] / args.share_stride
+                    )
                     suite_bytes += output_path.stat().st_size
                 else:
                     suite_invalid.append(

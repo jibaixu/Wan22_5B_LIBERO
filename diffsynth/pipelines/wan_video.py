@@ -208,7 +208,8 @@ class WanVideoPipeline(BasePipeline):
     def extract_dit_feature(
         self,
         prompt: str,
-        input_image: Image.Image,
+        input_image: Image.Image = None,
+        input_video: list[Image.Image] = None,
         height: int = 480,
         width: int = 480,
         num_frames: int = 17,
@@ -225,10 +226,26 @@ class WanVideoPipeline(BasePipeline):
     ):
         if decode_video:
             raise ValueError("extract_dit_feature only supports decode_video=False")
+        if input_image is None and input_video is None:
+            raise ValueError("extract_dit_feature requires input_image or input_video")
+        if input_image is not None and input_video is not None:
+            raise ValueError("extract_dit_feature accepts only one of input_image/input_video")
+        # Wan2.2-TI2V uses the first frame as a fused image condition while
+        # the remaining frames provide the video context.  When a real clip
+        # is supplied, reuse its first frame for that condition so the
+        # feature extractor does not silently fall back to video-to-video
+        # mode with an unconditioned first latent.
+        if input_video is not None and input_image is None and getattr(
+            self.dit, "fuse_vae_embedding_in_latents", False
+        ):
+            if not input_video:
+                raise ValueError("input_video must contain at least one frame")
+            input_image = input_video[0]
         return self(
             prompt=prompt,
             negative_prompt=negative_prompt,
             input_image=input_image,
+            input_video=input_video,
             height=height,
             width=width,
             num_frames=num_frames,

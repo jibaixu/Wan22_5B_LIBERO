@@ -56,7 +56,7 @@ def split_episodes(episodes, val_ratio=0.1, split_seed=42):
 
 
 def episode_windows(episode, stride, num_frames, split):
-    horizon = num_frames - 1
+    horizon = (num_frames - 1) * int(episode.get("temporal_stride", 1))
     for anchor_frame in range(0, episode["episode_length"], stride):
         yield {
             "suite": episode["suite"],
@@ -70,6 +70,7 @@ def episode_windows(episode, stride, num_frames, split):
             "valid_future_frames": min(
                 horizon, episode["episode_length"] - 1 - anchor_frame
             ),
+            "temporal_stride": int(episode.get("temporal_stride", 1)),
             "split": split,
         }
 
@@ -108,6 +109,8 @@ def build_manifests(
     split_seed=42,
     video_key="observation.images.image",
     num_frames=17,
+    temporal_stride=1,
+    episode_manifest=None,
     verify_expected_counts=True,
 ):
     if train_stride <= 0 or val_stride <= 0 or num_frames <= 0:
@@ -115,7 +118,13 @@ def build_manifests(
     if not 0 < val_ratio < 1:
         raise ValueError("val_ratio must be between 0 and 1")
 
-    episodes = discover_libero_episodes(data_root, video_key=video_key)
+    if episode_manifest:
+        episodes = [json.loads(line) for line in Path(episode_manifest).read_text(encoding="utf-8").splitlines() if line.strip()]
+        for suite_id, episode in enumerate(episodes):
+            episode.setdefault("suite_id", suite_id)
+            episode.setdefault("temporal_stride", temporal_stride)
+    else:
+        episodes = discover_libero_episodes(data_root, video_key=video_key)
     train_episodes, val_episodes = split_episodes(episodes, val_ratio, split_seed)
     train_rows = build_manifest_rows(train_episodes, train_stride, num_frames, "train")
     val_rows = build_manifest_rows(val_episodes, val_stride, num_frames, "val")
@@ -197,6 +206,9 @@ def parse_args():
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--video-key", default="observation.images.image")
     parser.add_argument("--num-frames", type=int, default=17)
+    parser.add_argument("--temporal-stride", type=int, default=1)
+    parser.add_argument("--episode-manifest", default=None,
+                        help="Canonical RoboTwin episode manifest.")
     parser.add_argument("--skip-expected-count-checks", action="store_true")
     return parser.parse_args()
 
@@ -212,6 +224,8 @@ if __name__ == "__main__":
         split_seed=args.split_seed,
         video_key=args.video_key,
         num_frames=args.num_frames,
+        temporal_stride=args.temporal_stride,
+        episode_manifest=args.episode_manifest,
         verify_expected_counts=not args.skip_expected_count_checks,
     )
     print(json.dumps(result["totals"], indent=2, sort_keys=True))

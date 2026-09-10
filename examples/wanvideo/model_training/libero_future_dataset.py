@@ -79,14 +79,14 @@ def discover_libero_episodes(data_root, video_key="observation.images.image"):
     return episodes
 
 
-def future_frame_ids(anchor_frame, episode_length, num_frames=17):
+def future_frame_ids(anchor_frame, episode_length, num_frames=17, temporal_stride=1):
     if episode_length <= 0:
         raise ValueError("episode_length must be positive")
     if not 0 <= anchor_frame < episode_length:
         raise ValueError(
             f"anchor_frame {anchor_frame} is outside episode length {episode_length}"
         )
-    return [min(anchor_frame + offset, episode_length - 1) for offset in range(num_frames)]
+    return [min(anchor_frame + offset * temporal_stride, episode_length - 1) for offset in range(num_frames)]
 
 
 class LiberoFutureWindowDataset(torch.utils.data.Dataset):
@@ -101,6 +101,7 @@ class LiberoFutureWindowDataset(torch.utils.data.Dataset):
         num_frames=17,
         max_open_readers=4,
         max_samples=None,
+        temporal_stride=1,
     ):
         self.manifest_path = str(Path(manifest_path).expanduser().resolve())
         self.data = read_jsonl(self.manifest_path)
@@ -117,6 +118,7 @@ class LiberoFutureWindowDataset(torch.utils.data.Dataset):
         self.height = int(height)
         self.width = int(width)
         self.num_frames = int(num_frames)
+        self.temporal_stride = int(temporal_stride)
         self.max_open_readers = int(max_open_readers)
         self.load_from_cache = False
         self._readers = OrderedDict()
@@ -142,7 +144,7 @@ class LiberoFutureWindowDataset(torch.utils.data.Dataset):
         row = self.data[index % len(self.data)]
         anchor_frame = int(row["anchor_frame"])
         episode_length = int(row["episode_length"])
-        frame_ids = future_frame_ids(anchor_frame, episode_length, self.num_frames)
+        frame_ids = future_frame_ids(anchor_frame, episode_length, self.num_frames, self.temporal_stride)
         reader = self._get_reader(row["video_path"])
         frames = [self._read_frame(reader, frame_id) for frame_id in frame_ids]
         suite = str(row["suite"])

@@ -73,6 +73,8 @@ def parse_args():
         default=None,
         help="Limit unique manifest rows for smoke tests.",
     )
+    parser.add_argument("--temporal-stride", type=int, default=1,
+                        help="Sparse frame interval; use 3 for RoboTwin 15 FPS / 50-step windows.")
     args = parser.parse_args()
     if args.dataset_metadata_path is None:
         parser.error("--dataset_metadata_path must point to a LIBERO JSONL manifest")
@@ -105,6 +107,7 @@ def main():
         width=args.width,
         num_frames=args.num_frames,
         max_samples=args.max_samples,
+        temporal_stride=args.temporal_stride,
     )
     model = LiberoWanTrainingModule(
         model_paths=args.model_paths,
