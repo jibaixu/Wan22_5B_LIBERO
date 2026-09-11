@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import gc
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from validate_libero_future import (  # noqa: E402
     evaluate_checkpoint,
     read_jsonl,
     stratified_selection,
+    validation_module,
 )
 
 
@@ -192,9 +194,23 @@ def main():
     checkpoints = [str(Path(checkpoint).expanduser().resolve()) for checkpoint in args.checkpoints]
     assignments = rank_checkpoint_assignments(checkpoints, rank, world_size)
 
+    # Keep one base pipeline and one reusable LoRA adapter per active rank.
+    # Ranks without checkpoints do not need to load the large base model.
+    reusable_module = None
+    if args.checkpoint_type == "lora" and (rank == 0 or assignments):
+        reusable_module = validation_module(None, "lora", device)
+
     base_evaluation = None
     if rank == 0:
-        base_result = evaluate_checkpoint(None, "base", dataset, indices, args.seed, device)
+        base_result = evaluate_checkpoint(
+            None,
+            "lora" if reusable_module is not None else "base",
+            dataset,
+            indices,
+            args.seed,
+            device,
+            module=reusable_module,
+        )
         base_evaluation = {
             "label": "base",
             "path": None,
@@ -206,7 +222,13 @@ def main():
     rank_evaluations = []
     for checkpoint_index, checkpoint in assignments:
         result = evaluate_checkpoint(
-            checkpoint, args.checkpoint_type, dataset, indices, args.seed, device
+            checkpoint,
+            args.checkpoint_type,
+            dataset,
+            indices,
+            args.seed,
+            device,
+            module=reusable_module,
         )
         rank_evaluations.append(
             {
@@ -227,6 +249,12 @@ def main():
                 "evaluations": rank_evaluations,
             },
         )
+
+    if reusable_module is not None:
+        del reusable_module
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if not assignments:
         atomic_json(

@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from diffsynth.diffusion import FlowMatchSFTLoss
+from diffsynth.core import load_state_dict
 from diffsynth.utils.data import save_video
 
 
@@ -83,6 +84,51 @@ def stratified_selection(rows, count, seed, namespace):
     return selected
 
 
+def _zero_lora_parameters(module):
+    """Disable an injected LoRA adapter without changing base weights."""
+    with torch.no_grad():
+        for name, parameter in module.pipe.dit.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                parameter.zero_()
+
+
+def load_lora_checkpoint(module, checkpoint_path):
+    """Replace the parameters of the existing DiT LoRA adapter."""
+    if checkpoint_path is None:
+        raise ValueError("LoRA checkpoint path is required")
+    lora = load_state_dict(
+        str(checkpoint_path),
+        torch_dtype=module.pipe.torch_dtype,
+        device=module.pipe.device,
+    )
+    lora_loader = module.pipe.lora_loader(
+        torch_dtype=module.pipe.torch_dtype, device=module.pipe.device
+    )
+    lora = lora_loader.convert_state_dict(lora)
+    lora = module.mapping_lora_state_dict(lora)
+    adapter_names = {
+        name
+        for name, _ in module.pipe.dit.named_parameters()
+        if "lora_A" in name or "lora_B" in name
+    }
+    checkpoint_names = set(lora)
+    missing = sorted(adapter_names - checkpoint_names)
+    unexpected = sorted(checkpoint_names - adapter_names)
+    if missing or unexpected:
+        raise RuntimeError(
+            "LoRA checkpoint does not match the injected adapter: "
+            f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
+    load_result = module.pipe.dit.load_state_dict(lora, strict=False)
+    missing_adapter = sorted(set(load_result.missing_keys) & adapter_names)
+    if missing_adapter or load_result.unexpected_keys:
+        raise RuntimeError(
+            "Failed to replace LoRA checkpoint: "
+            f"missing={missing_adapter[:10]}, unexpected={load_result.unexpected_keys[:10]}"
+        )
+    return module
+
+
 def validation_module(checkpoint_path, checkpoint_type, device):
     kwargs = {
         "model_id_with_origin_paths": MODEL_PATHS,
@@ -96,7 +142,9 @@ def validation_module(checkpoint_path, checkpoint_type, device):
                 "lora_base_model": "dit",
                 "lora_target_modules": "q,k,v,o,ffn.0,ffn.2",
                 "lora_rank": 32,
-                "lora_checkpoint": checkpoint_path,
+                # Inject the adapter once; individual checkpoints are loaded
+                # later by load_lora_checkpoint so the base model is reusable.
+                "lora_checkpoint": None,
             }
         )
     elif checkpoint_type == "full":
@@ -109,6 +157,10 @@ def validation_module(checkpoint_path, checkpoint_type, device):
     elif checkpoint_type != "base":
         raise ValueError(checkpoint_type)
     module = WanTrainingModule(**kwargs)
+    if checkpoint_type == "lora":
+        _zero_lora_parameters(module)
+        if checkpoint_path is not None:
+            load_lora_checkpoint(module, checkpoint_path)
     module.eval()
     return module
 
@@ -166,8 +218,15 @@ def aggregate_losses(samples):
     return result
 
 
-def evaluate_checkpoint(checkpoint_path, checkpoint_type, dataset, indices, seed, device):
-    module = validation_module(checkpoint_path, checkpoint_type, device)
+def evaluate_checkpoint(checkpoint_path, checkpoint_type, dataset, indices, seed, device, module=None):
+    owns_module = module is None
+    if owns_module:
+        module = validation_module(checkpoint_path, checkpoint_type, device)
+    elif checkpoint_type == "lora":
+        if checkpoint_path is None:
+            _zero_lora_parameters(module)
+        else:
+            load_lora_checkpoint(module, checkpoint_path)
     samples = []
     for selection_index, dataset_index in enumerate(indices):
         data = dataset[dataset_index]
@@ -192,10 +251,11 @@ def evaluate_checkpoint(checkpoint_path, checkpoint_type, dataset, indices, seed
             f"loss={loss:.6f} {data['sample_id']}"
         )
     aggregate = aggregate_losses(samples)
-    del module
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if owns_module:
+        del module
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return {"aggregate": aggregate, "samples": samples}
 
 
@@ -448,7 +508,16 @@ def main():
         ]
         atomic_json(output_dir / "loss_selection.json", selection)
         evaluations = []
-        base_result = evaluate_checkpoint(None, "base", dataset, indices, args.seed, args.device)
+        reusable_module = validation_module(None, "lora", args.device) if args.checkpoint_type == "lora" else None
+        base_result = evaluate_checkpoint(
+            None,
+            "lora" if reusable_module is not None else "base",
+            dataset,
+            indices,
+            args.seed,
+            args.device,
+            module=reusable_module,
+        )
         evaluations.append(
             {
                 "label": "base",
@@ -460,7 +529,13 @@ def main():
         for checkpoint in args.checkpoints:
             checkpoint = str(Path(checkpoint).expanduser().resolve())
             result = evaluate_checkpoint(
-                checkpoint, args.checkpoint_type, dataset, indices, args.seed, args.device
+                checkpoint,
+                args.checkpoint_type,
+                dataset,
+                indices,
+                args.seed,
+                args.device,
+                module=reusable_module,
             )
             evaluations.append(
                 {
@@ -474,6 +549,11 @@ def main():
                 output_dir / "validation_report.partial.json",
                 {"base_model": BASE_MODEL_ID, "evaluations": evaluations},
             )
+        if reusable_module is not None:
+            del reusable_module
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         tuned = min(
             evaluations[1:],
             key=lambda item: (

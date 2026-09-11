@@ -233,6 +233,7 @@ def cache_compatibility_metadata(
             "temporal_stride": str(temporal_stride),
             "effective_future_steps": str(16 * temporal_stride),
             "future_horizon_frames": str(16 * temporal_stride),
+            "cdb_anchor_contract": "shared_future_start",
         })
     if episode.get("teacher_feature_dim") is not None:
         metadata["feature_dim"] = str(episode["teacher_feature_dim"])
