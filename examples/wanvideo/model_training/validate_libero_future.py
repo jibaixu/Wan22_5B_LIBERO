@@ -319,31 +319,61 @@ def safe_sample_name(sample_id):
 def generate_videos(checkpoint_path, checkpoint_type, dataset, indices, output_dir, seed, device):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Materialize each selected validation row once.  All three outputs must
+    # describe the exact same sparse future window; re-reading the dataset in
+    # separate variant loops makes that invariant easy to accidentally break.
+    samples = []
+    for dataset_index in indices:
+        data = dataset[dataset_index]
+        if len(data["video"]) != 17:
+            raise ValueError(
+                f"Expected 17 validation frames for {data['sample_id']}, "
+                f"got {len(data['video'])}"
+            )
+        samples.append((dataset_index, data))
+
+    gt_dir = output_dir / "gt"
+    gt_dir.mkdir(parents=True, exist_ok=True)
     variants = [
         ("base", None, "base"),
         ("tuned", checkpoint_path, checkpoint_type),
     ]
     report = {"samples": {}}
+
+    # Save the ground-truth windows before generation.  These are the same
+    # 17 frames later passed to both pipelines (the first frame is the
+    # conditioning image), so gt/base/tuned share one sample identity.
+    for dataset_index, data in samples:
+        sample_name = safe_sample_name(data["sample_id"])
+        gt_path = gt_dir / f"{sample_name}.mp4"
+        save_video(data["video"], str(gt_path), fps=20, quality=7)
+        generation_seed = teacher_seed(
+            seed,
+            dataset.data[dataset_index]["suite_id"],
+            data["episode_index"],
+            data["anchor_frame"],
+        )
+        report["samples"][data["sample_id"]] = {
+            "suite": data["suite"],
+            "prompt": data["prompt"],
+            "seed": generation_seed,
+            "gt_video": str(gt_path),
+        }
+
     for variant, variant_checkpoint, variant_type in variants:
         pipe = load_wan_pipe(variant_checkpoint, variant_type, device=device)
         variant_dir = output_dir / variant
         variant_dir.mkdir(parents=True, exist_ok=True)
-        for dataset_index in indices:
-            data = dataset[dataset_index]
+        for dataset_index, data in samples:
             sample_name = safe_sample_name(data["sample_id"])
-            generation_seed = teacher_seed(
-                seed,
-                dataset.data[dataset_index]["suite_id"],
-                data["episode_index"],
-                data["anchor_frame"],
-            )
+            generation_seed = report["samples"][data["sample_id"]]["seed"]
             generated = pipe(
                 prompt=data["prompt"],
                 negative_prompt="",
                 input_image=data["video"][0],
                 height=480,
                 width=480,
-                num_frames=17,
+                num_frames=len(data["video"]),
                 seed=generation_seed,
                 rand_device="cpu",
                 cfg_scale=5.0,
@@ -351,26 +381,18 @@ def generate_videos(checkpoint_path, checkpoint_type, dataset, indices, output_d
                 sigma_shift=5.0,
                 tiled=False,
             )
+            if len(generated) != len(data["video"]):
+                raise ValueError(
+                    f"Generated/GT frame count mismatch for {data['sample_id']}: "
+                    f"generated={len(generated)}, gt={len(data['video'])}"
+                )
             video_path = variant_dir / f"{sample_name}.mp4"
             save_video(generated, str(video_path), fps=20, quality=7)
-            sample_report = report["samples"].setdefault(
-                data["sample_id"],
-                {
-                    "suite": data["suite"],
-                    "prompt": data["prompt"],
-                    "seed": generation_seed,
-                },
-            )
+            sample_report = report["samples"][data["sample_id"]]
             sample_report[variant] = {
                 "video": str(video_path),
                 "metrics": video_metrics(generated, data["video"]),
             }
-            if variant == "base":
-                gt_dir = output_dir / "gt"
-                gt_dir.mkdir(parents=True, exist_ok=True)
-                gt_path = gt_dir / f"{sample_name}.mp4"
-                save_video(data["video"], str(gt_path), fps=20, quality=7)
-                sample_report["gt_video"] = str(gt_path)
         del pipe
         gc.collect()
         if torch.cuda.is_available():

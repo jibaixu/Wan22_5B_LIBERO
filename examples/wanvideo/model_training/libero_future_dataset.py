@@ -144,7 +144,15 @@ class LiberoFutureWindowDataset(torch.utils.data.Dataset):
         row = self.data[index % len(self.data)]
         anchor_frame = int(row["anchor_frame"])
         episode_length = int(row["episode_length"])
-        frame_ids = future_frame_ids(anchor_frame, episode_length, self.num_frames, self.temporal_stride)
+        # The manifest is the source of truth for the sampling interval.  This
+        # matters for future-window validation: a RoboTwin row can cover 96
+        # source frames with 17 samples (temporal_stride=6), while older
+        # manifests may omit the field and should retain the constructor
+        # default for backwards compatibility.
+        temporal_stride = int(row.get("temporal_stride", self.temporal_stride))
+        if temporal_stride <= 0:
+            raise ValueError(f"temporal_stride must be positive, got {temporal_stride}")
+        frame_ids = future_frame_ids(anchor_frame, episode_length, self.num_frames, temporal_stride)
         reader = self._get_reader(row["video_path"])
         frames = [self._read_frame(reader, frame_id) for frame_id in frame_ids]
         suite = str(row["suite"])
@@ -157,6 +165,7 @@ class LiberoFutureWindowDataset(torch.utils.data.Dataset):
             "suite": suite,
             "episode_index": episode_index,
             "anchor_frame": anchor_frame,
+            "temporal_stride": temporal_stride,
             "valid_future_frames": int(row["valid_future_frames"]),
         }
 
