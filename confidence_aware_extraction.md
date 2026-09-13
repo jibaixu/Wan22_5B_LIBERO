@@ -89,14 +89,14 @@ calibration=train_quantile_05_95
 
 ## Confidence 校准
 
-LIBERO 的四个 task suite 使用彼此独立的 confidence 尺度。没有 episode 过滤的运行会把每个选中 suite 的全部 episode 作为一个校准单元：不传 `--suites` 时一次处理四个 suite，并分别计算四组 q05/q95；传入一个或多个 `--suites` 时，也分别对每个选中 suite 的完整 episode 集校准。
+LIBERO 的四个 task suite 使用彼此独立的 confidence 尺度。RoboTwin 则以 `(domain, task_id)` 为校准单元：Clean 与 Randomized 不共享 quantile，同一 domain 下不同 task 也不共享。完整 RoboTwin 运行会为每个 `robotwin_<domain>_<task>` 分组计算 q05/q95。
 
 ```text
 r = clip((disagreement - q05) / (q95 - q05 + 1e-8), 0, 1)
 confidence = 1 - r
 ```
 
-每套校准参数写入对应 suite 的 confidence feature 目录中的 `confidence_manifest.json`。默认输出时位于 `<suite-root>/<confidence-feature-directory>/confidence_manifest.json`；使用 `--output-root` 时位于 `<output-root>/<suite>/<confidence-feature-directory>/confidence_manifest.json`。内容包括：
+每套校准参数写入对应 suite/task 的 confidence feature 目录中的 `confidence_manifest.json`。RoboTwin metadata 额外记录 `calibration_scope=task_training_episodes`、`calibration_domain` 和 `calibration_task_id`。
 
 ```text
 confidence_aware

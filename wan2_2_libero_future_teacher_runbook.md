@@ -4,7 +4,7 @@
 
 ### Confidence-aware future teacher
 
-正式 future teacher 抽取使用 `--confidence-aware --num-teacher-samples 4`。每个 anchor 的四次推理只改变显式 diffusion seed，抽取器以 float32 流式累加器保存均值 feature 和 token-level pairwise cosine disagreement，不写入四份中间 feature。分片运行会先写 `complete=false, calibration=pending` 的缓存；没有 episode 范围或索引过滤的运行会按 suite 分别从该 suite 全部训练 episode 的 disagreement 计算 q05/q95，并原子重写各自的 `confidence`、`complete=true` 及 suite-local `confidence_manifest.json`。不传 `--suites` 时仍一次处理四个 suite，但不会混合它们的 calibration；传入 `--suites` 时会校准每个选中 suite。
+正式 future teacher 抽取使用 `--confidence-aware --num-teacher-samples 4`。每个 anchor 的四次推理只改变显式 diffusion seed，抽取器以 float32 流式累加器保存均值 feature 和 token-level pairwise cosine disagreement，不写入四份中间 feature。分片运行会先写 `complete=false, calibration=pending` 的缓存；RoboTwin 完整运行按 `(domain, task_id)` 分别计算 q05/q95，并原子重写各 task 的 `confidence`、`complete=true` 及 task-local `confidence_manifest.json`。Clean/Randomized 和不同 task 不共享 calibration；LIBERO 仍按 suite 校准。
 
 confidence-aware 缓存目录为 `wan2_2_future_latent_h16_step20_block20z_stride8_480x480_samples4_confv1`，新增 tensor 为 `confidence [A] float32` 和 `disagreement [A] float32`。旧目录仍保留为 legacy 单次 target，不能与 confidence-aware 缓存混用。
 
@@ -52,6 +52,9 @@ export DIFFSYNTH_DOWNLOAD_SOURCE=modelscope
 export HF_HOME=/data/jibaixu/Ckpts/huggingface
 export MODELSCOPE_CACHE=/data/jibaixu/Ckpts/modelscope
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# 8 GPU 同节点验证的本地模型缓存；首次运行复制约 20 GiB，后续直接复用。
+export MODEL_CACHE_DIR="${TMPDIR:-/dev/shm}/wan2.2-ti2v-5b"
 ```
 
 确认数据、GPU 和磁盘：
@@ -220,6 +223,7 @@ torchrun --standalone --nproc_per_node=8 \
   --checkpoints "${RUN_ROOT}"/lora_sft/step-*.safetensors \
   --mode loss \
   --loss-samples 256 \
+  --model-cache-dir "${MODEL_CACHE_DIR}" \
   --seed 42
 ```
 
@@ -233,6 +237,7 @@ python examples/wanvideo/model_training/validate_libero_future.py \
   --checkpoints "${RUN_ROOT}"/lora_sft/step-*.safetensors \
   --mode loss \
   --loss-samples 32 \
+  --model-cache-dir "${MODEL_CACHE_DIR}" \
   --seed 42
 ```
 
@@ -260,6 +265,7 @@ python examples/wanvideo/model_training/validate_libero_future.py \
   --selected-checkpoint "${CHECKPOINT_PATH}" \
   --mode video \
   --video-samples 32 \
+  --model-cache-dir "${MODEL_CACHE_DIR}" \
   --seed 42 \
   --approve-video-quality
 ```
@@ -296,6 +302,7 @@ torchrun --standalone --nproc_per_node=8 \
   --checkpoints "${RUN_ROOT}"/full_sft/epoch-*.safetensors \
   --mode loss \
   --loss-samples 256 \
+  --model-cache-dir "${MODEL_CACHE_DIR}" \
   --seed 42
 ```
 

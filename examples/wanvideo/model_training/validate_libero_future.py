@@ -29,6 +29,7 @@ from libero_future_utils import (  # noqa: E402
     BASE_MODEL_ID,
     checkpoint_sha256,
     load_wan_pipe,
+    prepare_model_cache,
     teacher_seed,
 )
 from train import WanTrainingModule  # noqa: E402
@@ -475,6 +476,14 @@ def parse_args():
     parser.add_argument("--loss-samples", type=int, default=256)
     parser.add_argument("--video-samples", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--model-cache-dir",
+        default=None,
+        help=(
+            "Optional node-local directory for a one-time copy of the Wan "
+            "weights. All ranks can then load from local storage."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--approve-video-quality",
@@ -486,6 +495,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.model_cache_dir:
+        os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = prepare_model_cache(
+            args.model_cache_dir
+        )
+        os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "true"
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = read_jsonl(args.val_manifest)

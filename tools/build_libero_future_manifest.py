@@ -97,6 +97,7 @@ def episode_windows(episode, stride, num_frames, split):
         yield {
             "suite": episode["suite"],
             "suite_id": episode["suite_id"],
+            **({key: episode[key] for key in ("domain", "task_id") if key in episode}),
             "dataset_root": episode["dataset_root"],
             "episode_index": episode["episode_index"],
             "episode_length": episode["episode_length"],

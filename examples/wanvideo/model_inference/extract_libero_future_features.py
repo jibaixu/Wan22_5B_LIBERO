@@ -226,6 +226,8 @@ def cache_compatibility_metadata(
         temporal_stride = int(episode.get("teacher_temporal_stride", 3))
         metadata.update({
             "dataset_format": "robotwin",
+            "domain": str(episode.get("domain", "")),
+            "task_id": str(episode.get("task_id", "")),
             "fps": str(episode.get("fps", 15)),
             "video_key": str(episode.get("video_key", "observation.images.image")),
             "prompt_source": "robotwin_teacher_manifest",
@@ -499,7 +501,21 @@ def finalize_confidence_cache(episodes, output_root, checkpoint_path, checkpoint
         raise RuntimeError("Cannot calibrate empty or non-finite disagreement statistics")
     q_low = float(torch.quantile(raw, 0.05).item())
     q_high = float(torch.quantile(raw, 0.95).item())
+    if not q_high > q_low:
+        raise ValueError(f"Degenerate disagreement quantiles for suite {suite}")
     calibration = {"q_low": q_low, "q_high": q_high, "eps": 1e-8}
+    robotwin = episodes[0].get("dataset_format") == "robotwin"
+    if robotwin:
+        domains = {str(item.get("domain", "")).strip().lower() for item in episodes}
+        task_ids = {str(item.get("task_id", "")).strip() for item in episodes}
+        if len(domains) != 1 or not next(iter(domains), "") or len(task_ids) != 1 or not next(iter(task_ids), ""):
+            raise ValueError(f"RoboTwin calibration requires one domain/task group for {suite}")
+        calibration_scope = "task_training_episodes"
+        calibration_domain = next(iter(domains))
+        calibration_task_id = next(iter(task_ids))
+    else:
+        calibration_scope = "suite_training_episodes"
+        calibration_domain = calibration_task_id = None
     for episode, path in zip(episodes, paths):
         with safe_open(path, framework="pt", device="cpu") as file:
             tensors = {
@@ -514,8 +530,13 @@ def finalize_confidence_cache(episodes, output_root, checkpoint_path, checkpoint
         metadata.update(confidence_cache_metadata(
             episode, checkpoint_path, checkpoint_hash, base_seed, num_teacher_samples,
             complete=True, calibration=calibration,
-            calibration_scope="suite_training_episodes",
+            calibration_scope=calibration_scope,
         ))
+        if robotwin:
+            metadata.update({
+                "calibration_domain": calibration_domain,
+                "calibration_task_id": calibration_task_id,
+            })
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.unlink(missing_ok=True)
         save_file(tensors, temporary, metadata=metadata)
@@ -530,11 +551,12 @@ def finalize_confidence_cache(episodes, output_root, checkpoint_path, checkpoint
         "confidence_aware": True, "confidence_version": "v1",
         "num_teacher_samples": int(num_teacher_samples),
         "calibration": "train_quantile_05_95",
-        "calibration_scope": "suite_training_episodes", "suite": suite,
+        "calibration_scope": calibration_scope, "suite": suite,
         "q_low": q_low,
         "q_high": q_high, "eps": calibration["eps"],
         "episode_count": len(paths), "anchor_count": int(raw.numel()),
         "checkpoint_path": checkpoint_path, "checkpoint_sha256": checkpoint_hash,
+        **({"domain": calibration_domain, "task_id": calibration_task_id} if robotwin else {}),
     })
     return calibration
 
@@ -838,21 +860,27 @@ def main():
                         break
                     with safe_open(path, framework="pt", device="cpu") as file:
                         metadata = file.metadata() or {}
-                    if (
-                        metadata.get("calibration_scope")
-                        != "suite_training_episodes"
-                        or metadata.get("calibration_suite") != suite
-                    ):
+                    if metadata.get("calibration_suite") != suite:
+                        finalized = False
+                        break
+                    if episode.get("dataset_format") == "robotwin":
+                        expected_group = (str(episode.get("domain", "")).lower(), str(episode.get("task_id", "")))
+                        actual_group = (metadata.get("calibration_domain"), metadata.get("calibration_task_id"))
+                        if metadata.get("calibration_scope") != "task_training_episodes" or actual_group != expected_group:
+                            finalized = False
+                            break
+                    elif metadata.get("calibration_scope") != "suite_training_episodes":
                         finalized = False
                         break
                 if finalized:
                     with open(manifest_path, "r", encoding="utf-8") as file:
                         manifest = json.load(file)
-                    if (
-                        manifest.get("suite") != suite
-                        or manifest.get("calibration_scope")
-                        != "suite_training_episodes"
-                    ):
+                    if manifest.get("suite") != suite:
+                        finalized = False
+                    elif episode.get("dataset_format") == "robotwin":
+                        if manifest.get("calibration_scope") != "task_training_episodes" or manifest.get("domain") != str(episode.get("domain", "")).lower() or manifest.get("task_id") != str(episode.get("task_id", "")):
+                            finalized = False
+                    elif manifest.get("calibration_scope") != "suite_training_episodes":
                         finalized = False
             if finalized:
                 calibrations[suite] = {

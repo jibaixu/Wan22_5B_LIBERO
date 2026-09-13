@@ -21,6 +21,7 @@ from validate_libero_future import (  # noqa: E402
     atomic_json,
     checkpoint_sha256,
     evaluate_checkpoint,
+    prepare_model_cache,
     read_jsonl,
     stratified_selection,
     validation_module,
@@ -44,6 +45,14 @@ def parse_args():
     parser.add_argument("--mode", choices=("loss",), default="loss")
     parser.add_argument("--loss-samples", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--model-cache-dir",
+        default=None,
+        help=(
+            "Optional node-local directory for a one-time copy of the Wan "
+            "weights before any rank loads a model."
+        ),
+    )
     parser.add_argument(
         "--device",
         default=None,
@@ -172,6 +181,14 @@ def main():
         raise ValueError("Parallel loss validation requires --checkpoints")
     rank, local_rank, world_size = init_distributed()
     device = rank_device(args, local_rank)
+
+    if args.model_cache_dir:
+        os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = prepare_model_cache(
+            args.model_cache_dir
+        )
+        os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "true"
+        if world_size > 1:
+            dist.barrier()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     rank_dir = output_dir / "loss_rank_results"
