@@ -13,6 +13,7 @@ from diffsynth.pipelines.wan_video import ModelConfig, WanVideoPipeline
 
 
 BASE_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B"
+TOKENIZER_MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B"
 FEATURE_DIRECTORY = "wan2_2_future_latent_h16_step20_block20z_stride8_480x480"
 
 
@@ -45,6 +46,7 @@ def prepare_model_cache(cache_dir):
             "DiffSynth-Studio/Wan-Series-Converted-Safetensors",
             "Wan2.2_VAE.safetensors",
         ),
+        (TOKENIZER_MODEL_ID, "google/umt5-xxl/*"),
     ]
     files = []
     for model_id, pattern in model_specs:
@@ -55,9 +57,13 @@ def prepare_model_cache(cache_dir):
                 f"No model files matched {source_dir / pattern}. "
                 "Set DIFFSYNTH_MODEL_BASE_PATH to a complete local model directory."
             )
-        for source_path in matches:
-            if not source_path.is_file():
-                continue
+        file_matches = [source_path for source_path in matches if source_path.is_file()]
+        if not file_matches:
+            raise FileNotFoundError(
+                f"Model pattern matched no files: {source_dir / pattern}. "
+                "Set DIFFSYNTH_MODEL_BASE_PATH to a complete local model directory."
+            )
+        for source_path in file_matches:
             relative_path = Path(model_id) / source_path.relative_to(source_dir)
             files.append((source_path, cache_root / relative_path))
 
@@ -86,6 +92,11 @@ def prepare_model_cache(cache_dir):
             started = time.monotonic()
             for source_path, target_path in files:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    target_path.is_file()
+                    and target_path.stat().st_size == source_path.stat().st_size
+                ):
+                    continue
                 partial_path = target_path.with_name(target_path.name + ".partial")
                 shutil.copyfile(source_path, partial_path)
                 if partial_path.stat().st_size != source_path.stat().st_size:
@@ -137,11 +148,20 @@ def wan_model_configs():
     ]
 
 
+def wan_tokenizer_config():
+    """Return the tokenizer config shared by training and inference."""
+    return ModelConfig(
+        model_id=TOKENIZER_MODEL_ID,
+        origin_file_pattern="google/umt5-xxl/",
+    )
+
+
 def load_wan_pipe(checkpoint_path=None, checkpoint_type="base", device="cuda"):
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=device,
         model_configs=wan_model_configs(),
+        tokenizer_config=wan_tokenizer_config(),
     )
     if checkpoint_type == "base":
         if checkpoint_path is not None:

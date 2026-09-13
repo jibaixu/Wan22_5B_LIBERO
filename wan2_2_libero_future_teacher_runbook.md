@@ -54,6 +54,7 @@ export MODELSCOPE_CACHE=/data/jibaixu/Ckpts/modelscope
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 8 GPU 同节点验证的本地模型缓存；首次运行复制约 20 GiB，后续直接复用。
+# 缓存包含 DiT/VAE/T5 权重以及 Wan2.1 UMT5 tokenizer。
 export MODEL_CACHE_DIR="${TMPDIR:-/dev/shm}/wan2.2-ti2v-5b"
 ```
 
