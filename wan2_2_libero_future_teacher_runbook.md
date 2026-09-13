@@ -258,8 +258,11 @@ echo "${CHECKPOINT_PATH}"
 
 目的：为固定的 32 个 val anchors 分别生成 base 和 tuned 结果，同时保存 GT，报告首帧保持、future/final-frame PSNR/SSIM 和 temporal change。
 
+视频验证使用 Wan 的 Unified Sequence Parallel（USP）：8 个 rank 协同生成同一个视频，而不是每张卡各生成一部分样本。基座模型从 `MODEL_CACHE_DIR` 的节点本地缓存加载一次；同一进程先生成 base，再在原管线上应用 tuned checkpoint，因此不会为两个变体重复加载 5B 权重。需要在环境中安装 `xfuser[flash-attn]>=0.4.3` 和 `yunchang`。
+
 ```bash
-python examples/wanvideo/model_training/validate_libero_future.py \
+torchrun --standalone --nproc_per_node=8 \
+  examples/wanvideo/model_training/validate_libero_future.py \
   --val-manifest "${RUN_ROOT}/manifests/val.jsonl" \
   --output-dir "${RUN_ROOT}/validation/lora" \
   --checkpoint-type "${CHECKPOINT_TYPE}" \
@@ -267,6 +270,7 @@ python examples/wanvideo/model_training/validate_libero_future.py \
   --mode video \
   --video-samples 32 \
   --model-cache-dir "${MODEL_CACHE_DIR}" \
+  --use-usp \
   --seed 42 \
   --approve-video-quality
 ```

@@ -27,6 +27,7 @@ sys.path.insert(0, str(WANVIDEO_DIR))
 from libero_future_dataset import LiberoFutureWindowDataset, read_jsonl  # noqa: E402
 from libero_future_utils import (  # noqa: E402
     BASE_MODEL_ID,
+    apply_wan_checkpoint,
     checkpoint_sha256,
     load_wan_pipe,
     prepare_model_cache,
@@ -317,9 +318,35 @@ def safe_sample_name(sample_id):
     return sample_id.replace(":", "_")
 
 
-def generate_videos(checkpoint_path, checkpoint_type, dataset, indices, output_dir, seed, device):
+def _distributed_rank():
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _distributed_barrier():
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def generate_videos(
+    checkpoint_path,
+    checkpoint_type,
+    dataset,
+    indices,
+    output_dir,
+    seed,
+    device,
+    use_usp=False,
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    rank, _ = _distributed_rank()
+    is_main_process = rank == 0
     # Materialize each selected validation row once.  All three outputs must
     # describe the exact same sparse future window; re-reading the dataset in
     # separate variant loops makes that invariant easy to accidentally break.
@@ -347,7 +374,8 @@ def generate_videos(checkpoint_path, checkpoint_type, dataset, indices, output_d
     for dataset_index, data in samples:
         sample_name = safe_sample_name(data["sample_id"])
         gt_path = gt_dir / f"{sample_name}.mp4"
-        save_video(data["video"], str(gt_path), fps=20, quality=7)
+        if is_main_process:
+            save_video(data["video"], str(gt_path), fps=20, quality=7)
         generation_seed = teacher_seed(
             seed,
             dataset.data[dataset_index]["suite_id"],
@@ -361,8 +389,18 @@ def generate_videos(checkpoint_path, checkpoint_type, dataset, indices, output_d
             "gt_video": str(gt_path),
         }
 
+    # Load the large base model once.  The tuned checkpoint is applied after
+    # the base pass so both variants use the same pipeline and local cache.
+    pipe = load_wan_pipe(device=device, use_usp=use_usp)
+    rank, world_size = _distributed_rank()
+    is_main_process = rank == 0
+    if is_main_process and use_usp:
+        print(f"USP video inference enabled across {world_size} ranks")
+    _distributed_barrier()
     for variant, variant_checkpoint, variant_type in variants:
-        pipe = load_wan_pipe(variant_checkpoint, variant_type, device=device)
+        if variant == "tuned":
+            apply_wan_checkpoint(pipe, variant_checkpoint, variant_type)
+        _distributed_barrier()
         variant_dir = output_dir / variant
         variant_dir.mkdir(parents=True, exist_ok=True)
         for dataset_index, data in samples:
@@ -387,34 +425,38 @@ def generate_videos(checkpoint_path, checkpoint_type, dataset, indices, output_d
                     f"Generated/GT frame count mismatch for {data['sample_id']}: "
                     f"generated={len(generated)}, gt={len(data['video'])}"
                 )
-            video_path = variant_dir / f"{sample_name}.mp4"
-            save_video(generated, str(video_path), fps=20, quality=7)
-            sample_report = report["samples"][data["sample_id"]]
-            sample_report[variant] = {
-                "video": str(video_path),
-                "metrics": video_metrics(generated, data["video"]),
+            if is_main_process:
+                video_path = variant_dir / f"{sample_name}.mp4"
+                save_video(generated, str(video_path), fps=20, quality=7)
+                sample_report = report["samples"][data["sample_id"]]
+                sample_report[variant] = {
+                    "video": str(video_path),
+                    "metrics": video_metrics(generated, data["video"]),
+                }
+            _distributed_barrier()
+    del pipe
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _distributed_barrier()
+    if is_main_process:
+        for variant in ("base", "tuned"):
+            metrics = [sample[variant]["metrics"] for sample in report["samples"].values()]
+            report[f"{variant}_aggregate"] = {
+                key: statistics.fmean(item[key] for item in metrics)
+                for key in (
+                    "condition_psnr",
+                    "condition_ssim",
+                    "future_psnr_mean",
+                    "future_ssim_mean",
+                    "final_frame_psnr",
+                    "final_frame_ssim",
+                    "temporal_change_mean",
+                )
             }
-        del pipe
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    for variant in ("base", "tuned"):
-        metrics = [sample[variant]["metrics"] for sample in report["samples"].values()]
-        report[f"{variant}_aggregate"] = {
-            key: statistics.fmean(item[key] for item in metrics)
-            for key in (
-                "condition_psnr",
-                "condition_ssim",
-                "future_psnr_mean",
-                "future_ssim_mean",
-                "final_frame_psnr",
-                "final_frame_ssim",
-                "temporal_change_mean",
+            report[f"{variant}_aggregate"]["exact_static_copy_count"] = sum(
+                item["exact_static_copy"] for item in metrics
             )
-        }
-        report[f"{variant}_aggregate"]["exact_static_copy_count"] = sum(
-            item["exact_static_copy"] for item in metrics
-        )
     return report
 
 
@@ -484,6 +526,11 @@ def parse_args():
             "weights. All ranks can then load from local storage."
         ),
     )
+    parser.add_argument(
+        "--use-usp",
+        action="store_true",
+        help="Use Unified Sequence Parallel for same-video multi-GPU inference.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--approve-video-quality",
@@ -495,6 +542,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.use_usp and args.mode != "video":
+        raise ValueError("--use-usp is supported only with --mode video")
     if args.model_cache_dir:
         os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = prepare_model_cache(
             args.model_cache_dir
@@ -652,32 +701,35 @@ def main():
             video_dir,
             args.seed,
             args.device,
+            args.use_usp,
         )
-        atomic_json(video_dir / "metrics.json", video_report)
-        write_video_index(video_dir, video_report)
-        tuned_metrics = video_report["tuned_aggregate"]
-        numeric_keys = (
-            "condition_psnr",
-            "condition_ssim",
-            "future_psnr_mean",
-            "future_ssim_mean",
-            "final_frame_psnr",
-            "final_frame_ssim",
-            "temporal_change_mean",
-        )
-        auto_checks = {
-            "all_metrics_finite": all(
-                math.isfinite(float(tuned_metrics[key])) for key in numeric_keys
-            ),
-            "no_exact_static_copies": tuned_metrics["exact_static_copy_count"] == 0,
-        }
-        report["video_validation"] = str(video_dir / "metrics.json")
-        report["video_index"] = str(video_dir / "index.html")
-        report["video_auto_checks"] = auto_checks
-        report["video_quality_approved"] = args.approve_video_quality
-        report["video_passed"] = all(auto_checks.values()) and args.approve_video_quality
-        report["passed"] = report.get("loss_passed", False) and report["video_passed"]
-        atomic_json(output_dir / "validation_report.json", report)
+        rank, _ = _distributed_rank()
+        if rank == 0:
+            atomic_json(video_dir / "metrics.json", video_report)
+            write_video_index(video_dir, video_report)
+            tuned_metrics = video_report["tuned_aggregate"]
+            numeric_keys = (
+                "condition_psnr",
+                "condition_ssim",
+                "future_psnr_mean",
+                "future_ssim_mean",
+                "final_frame_psnr",
+                "final_frame_ssim",
+                "temporal_change_mean",
+            )
+            auto_checks = {
+                "all_metrics_finite": all(
+                    math.isfinite(float(tuned_metrics[key])) for key in numeric_keys
+                ),
+                "no_exact_static_copies": tuned_metrics["exact_static_copy_count"] == 0,
+            }
+            report["video_validation"] = str(video_dir / "metrics.json")
+            report["video_index"] = str(video_dir / "index.html")
+            report["video_auto_checks"] = auto_checks
+            report["video_quality_approved"] = args.approve_video_quality
+            report["video_passed"] = all(auto_checks.values()) and args.approve_video_quality
+            report["passed"] = report.get("loss_passed", False) and report["video_passed"]
+            atomic_json(output_dir / "validation_report.json", report)
 
 
 if __name__ == "__main__":

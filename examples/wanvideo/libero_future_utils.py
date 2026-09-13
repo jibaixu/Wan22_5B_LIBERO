@@ -156,13 +156,8 @@ def wan_tokenizer_config():
     )
 
 
-def load_wan_pipe(checkpoint_path=None, checkpoint_type="base", device="cuda"):
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device=device,
-        model_configs=wan_model_configs(),
-        tokenizer_config=wan_tokenizer_config(),
-    )
+def apply_wan_checkpoint(pipe, checkpoint_path, checkpoint_type):
+    """Apply a validation checkpoint to an already-loaded Wan pipeline."""
     if checkpoint_type == "base":
         if checkpoint_path is not None:
             raise ValueError("Base model does not accept a checkpoint path")
@@ -174,7 +169,7 @@ def load_wan_pipe(checkpoint_path=None, checkpoint_type="base", device="cuda"):
         if checkpoint_path is None:
             raise ValueError("Full checkpoint path is required")
         state_dict = load_state_dict(
-            str(checkpoint_path), torch_dtype=torch.bfloat16, device=device
+            str(checkpoint_path), torch_dtype=torch.bfloat16, device=pipe.device
         )
         missing, unexpected = pipe.dit.load_state_dict(state_dict, strict=False)
         if unexpected:
@@ -184,6 +179,19 @@ def load_wan_pipe(checkpoint_path=None, checkpoint_type="base", device="cuda"):
     else:
         raise ValueError(f"Unsupported checkpoint type {checkpoint_type!r}")
     return pipe
+
+
+def load_wan_pipe(
+    checkpoint_path=None, checkpoint_type="base", device="cuda", use_usp=False
+):
+    pipe = WanVideoPipeline.from_pretrained(
+        torch_dtype=torch.bfloat16,
+        device=device,
+        use_usp=use_usp,
+        model_configs=wan_model_configs(),
+        tokenizer_config=wan_tokenizer_config(),
+    )
+    return apply_wan_checkpoint(pipe, checkpoint_path, checkpoint_type)
 
 
 def checkpoint_sha256(path, chunk_size=8 * 1024 * 1024):
