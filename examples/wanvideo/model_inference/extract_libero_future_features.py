@@ -38,6 +38,9 @@ from libero_future_utils import (  # noqa: E402
 from diffsynth.pipelines.wan_video import WanFeatureCaptureSpec  # noqa: E402
 
 
+DEFAULT_FEATURE_DIRECTORY = FEATURE_DIRECTORY
+
+
 REQUIRED_TENSOR_KEYS = {"features", "anchor_frames", "valid_future_frames"}
 CONFIDENCE_TENSOR_KEYS = {"confidence", "disagreement"}
 REQUIRED_METADATA = {
@@ -344,8 +347,17 @@ def cache_metadata(episode, checkpoint_path, checkpoint_hash, base_seed):
     return metadata
 
 
+def active_feature_directory(confidence_aware=False, num_teacher_samples=4):
+    if confidence_aware and FEATURE_DIRECTORY == DEFAULT_FEATURE_DIRECTORY:
+        return confidence_feature_directory(num_teacher_samples)
+    # An explicit --feature-directory is already a complete destination name
+    # (for example, a PCA-transformed directory); do not append the confidence
+    # suffix and silently diverge from the caller's path.
+    return FEATURE_DIRECTORY
+
+
 def episode_output_path(episode, output_root=None, confidence_aware=False, num_teacher_samples=4):
-    directory = confidence_feature_directory(num_teacher_samples) if confidence_aware else FEATURE_DIRECTORY
+    directory = active_feature_directory(confidence_aware, num_teacher_samples)
     if episode.get("dataset_format") == "robotwin":
         # A manifest row already points at its task-local LeRobot root.  Keep
         # each task's cache beside its source video; otherwise one global
@@ -648,6 +660,11 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--audit-only", action="store_true")
+    parser.add_argument(
+        "--finalize-confidence",
+        action="store_true",
+        help="Finalize confidence-aware caches already extracted from a full manifest.",
+    )
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
@@ -685,6 +702,14 @@ def main():
         FEATURE_DIRECTORY = str(args.feature_directory)
     if args.audit_only and args.overwrite:
         raise ValueError("--audit-only and --overwrite cannot be used together")
+    if args.finalize_confidence and not args.confidence_aware:
+        raise ValueError("--finalize-confidence requires --confidence-aware")
+    if args.finalize_confidence and not args.manifest:
+        raise ValueError("--finalize-confidence requires --manifest")
+    if args.finalize_confidence and has_episode_filter(args):
+        raise ValueError("--finalize-confidence requires an unfiltered manifest")
+    if args.finalize_confidence and (args.dry_run or args.audit_only or args.smoke_test):
+        raise ValueError("--finalize-confidence cannot be combined with dry/audit/smoke mode")
     if args.num_teacher_samples < 1:
         raise ValueError("--num-teacher-samples must be positive")
     if args.confidence_aware and args.num_teacher_samples < 2:
@@ -713,6 +738,57 @@ def main():
     selected = filter_episodes(list(enumerate(episodes)), args)
     if not selected:
         raise ValueError("Episode filters selected no work")
+    if args.finalize_confidence:
+        if args.validation_report is None:
+            raise ValueError("Confidence finalization requires --validation-report")
+        checkpoint_hash = broadcast_checkpoint_hash(checkpoint_path, rank, world_size)
+        verify_validation_gate(
+            args.validation_report,
+            checkpoint_path,
+            checkpoint_hash,
+            args.checkpoint_type,
+        )
+        calibrations = {}
+        if rank == 0:
+            for suite in sorted({episode["suite"] for _, episode in selected}):
+                suite_episodes = [
+                    episode for episode in episodes if episode["suite"] == suite
+                ]
+                manifest_path = confidence_manifest_path(
+                    suite_episodes[0], args.output_root, args.num_teacher_samples
+                )
+                calibration = finalize_confidence_cache(
+                    suite_episodes,
+                    args.output_root,
+                    checkpoint_path,
+                    checkpoint_hash,
+                    args.base_seed,
+                    args.num_teacher_samples,
+                    manifest_path,
+                )
+                calibrations[suite] = {
+                    **calibration,
+                    "suite": suite,
+                    "manifest_path": str(manifest_path),
+                }
+            atomic_json(
+                Path(args.progress_dir).expanduser().resolve()
+                / "confidence_finalization_summary.json",
+                {
+                    "complete": True,
+                    "checkpoint_path": checkpoint_path,
+                    "checkpoint_sha256": checkpoint_hash,
+                    "confidence_aware": True,
+                    "num_teacher_samples": args.num_teacher_samples,
+                    "selected_episodes": len(selected),
+                    "calibrations": calibrations,
+                },
+            )
+        if world_size > 1:
+            dist.barrier()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
     if args.smoke_test:
         has_filter = bool(
             args.suites
@@ -926,7 +1002,7 @@ def main():
             "completed_episodes": sum(item["completed_episodes"] for item in rank_progress),
             "anchors": sum(item["anchors"] for item in rank_progress),
             "bytes": sum(item["bytes"] for item in rank_progress),
-            "feature_directory": confidence_feature_directory(args.num_teacher_samples) if args.confidence_aware else FEATURE_DIRECTORY,
+            "feature_directory": active_feature_directory(args.confidence_aware, args.num_teacher_samples),
             "confidence_aware": args.confidence_aware,
             "num_teacher_samples": args.num_teacher_samples if args.confidence_aware else 1,
             "calibrations": calibrations,
@@ -991,7 +1067,7 @@ def main():
                 "completed_episodes": suite_completed,
                 "anchors": suite_anchors,
                 "bytes": suite_bytes,
-                "feature_directory": confidence_feature_directory(args.num_teacher_samples) if args.confidence_aware else FEATURE_DIRECTORY,
+                "feature_directory": active_feature_directory(args.confidence_aware, args.num_teacher_samples),
                 "confidence_aware": args.confidence_aware,
                 "num_teacher_samples": args.num_teacher_samples if args.confidence_aware else 1,
                 "calibration": calibrations.get(suite),
