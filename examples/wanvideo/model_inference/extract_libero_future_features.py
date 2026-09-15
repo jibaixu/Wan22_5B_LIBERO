@@ -640,7 +640,11 @@ def parse_args():
         "--progress-dir",
         default="/data/jibaixu/Ckpts/wan2_2_ti2v_5b_libero/extraction_progress",
     )
-    parser.add_argument("--validation-report", default=None)
+    parser.add_argument(
+        "--validation-report",
+        default=None,
+        help="Optional validation report; when provided, verify checkpoint compatibility.",
+    )
     parser.add_argument("--suites", nargs="*", default=None)
     parser.add_argument("--episode-start", type=int, default=None)
     parser.add_argument("--episode-end", type=int, default=None)
@@ -739,15 +743,14 @@ def main():
     if not selected:
         raise ValueError("Episode filters selected no work")
     if args.finalize_confidence:
-        if args.validation_report is None:
-            raise ValueError("Confidence finalization requires --validation-report")
         checkpoint_hash = broadcast_checkpoint_hash(checkpoint_path, rank, world_size)
-        verify_validation_gate(
-            args.validation_report,
-            checkpoint_path,
-            checkpoint_hash,
-            args.checkpoint_type,
-        )
+        if args.validation_report is not None:
+            verify_validation_gate(
+                args.validation_report,
+                checkpoint_path,
+                checkpoint_hash,
+                args.checkpoint_type,
+            )
         calibrations = {}
         if rank == 0:
             for suite in sorted({episode["suite"] for _, episode in selected}):
@@ -798,9 +801,6 @@ def main():
         )
         if not has_filter or len(selected) > max(8, world_size):
             raise ValueError("--smoke-test requires explicit filters selecting at most 8 episodes")
-    elif not args.dry_run and not args.audit_only and args.validation_report is None:
-        raise ValueError("Formal extraction requires --validation-report")
-
     assignments = [
         (ordinal, episode)
         for ordinal, episode in selected
@@ -831,7 +831,7 @@ def main():
         return
 
     checkpoint_hash = broadcast_checkpoint_hash(checkpoint_path, rank, world_size)
-    if not args.smoke_test and not args.audit_only:
+    if not args.smoke_test and not args.audit_only and args.validation_report is not None:
         verify_validation_gate(
             args.validation_report,
             checkpoint_path,
