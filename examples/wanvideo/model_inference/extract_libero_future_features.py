@@ -587,6 +587,19 @@ def init_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # A Slurm task launched directly with ``srun`` is a single-process job,
+    # even though the allocation may contain many tasks.  When Slurm masks
+    # each task to one GPU, CUDA indexes that GPU as cuda:0 inside the task.
+    # Under torchrun, LOCAL_RANK remains authoritative for the multi-process
+    # path.
+    if world_size == 1 and "SLURM_PROCID" in os.environ:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if visible_devices:
+            local_rank = 0 if len(visible_devices.split(",")) == 1 else int(
+                os.environ.get("SLURM_LOCALID", "0")
+            )
+        else:
+            local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="gloo")
     if torch.cuda.is_available():
